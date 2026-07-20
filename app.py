@@ -194,11 +194,15 @@ async def scan_once(application: Application) -> int:
     return len(new_items)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.effective_chat is None or update.message is None:
         return
 
     add_subscriber(update.effective_chat.id)
+
     await update.message.reply_text(
         "✅ Radar Affari attivato.\n\n"
         "/status - mostra lo stato\n"
@@ -208,7 +212,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
@@ -220,7 +227,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def test(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
@@ -230,19 +240,27 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scan(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
     await update.message.reply_text("🔍 Controllo in corso…")
+
     count = await scan_once(context.application)
+
     await update.message.reply_text(
         f"✅ Controllo terminato.\n"
         f"Nuovi elementi trovati: {count}"
     )
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.effective_chat is None or update.message is None:
         return
 
