@@ -48,7 +48,7 @@ SOURCE_URLS = [
 DATA_DIR = Path(tempfile.gettempdir()) / "radar_affari_ai"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = DATA_DIR / "radar_state.json"
+STATE_FILE = DATA_DIR / "radar_state_v2.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
 
 HEADERS = {
