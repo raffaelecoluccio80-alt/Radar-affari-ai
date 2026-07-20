@@ -307,7 +307,7 @@ async def scan_once(application: Application) -> int:
         try:
             extracted_items = await extract_items(source_url)
             for item in extracted_items:
-                seen.add(item["id])
+                seen.add(item["id"])
                          new_items.append(item)
         except Exception as exc:
             log.exception("Errore fonte %s: %s", source_url, exc)
