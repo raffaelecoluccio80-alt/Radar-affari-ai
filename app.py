@@ -48,7 +48,7 @@ SOURCE_URLS = [
 DATA_DIR = Path(tempfile.gettempdir()) / "radar_affari_ai"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = DATA_DIR / "radar_state_v2.json"
+STATE_FILE = DATA_DIR / "radar_state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
 
 HEADERS = {
@@ -128,8 +128,10 @@ def is_probable_listing_url(url: str) -> bool:
     if "subito.it" in host:
         if path in ("", "/"):
             return False
+
         if re.search(r"-\d{6,}\.htm$", path):
             return True
+
         return path.count("/") >= 2 and path.endswith(".htm")
 
     return True
@@ -146,14 +148,17 @@ def add_item(
 
     if len(title) < 8:
         return
+
     if not is_probable_listing_url(absolute_url):
         return
 
     matched = matching_keywords(title)
+
     if not matched:
         return
 
     item_id = create_item_id(absolute_url, title)
+
     items[item_id] = {
         "id": item_id,
         "title": title[:180],
@@ -165,8 +170,10 @@ def add_item(
 def walk_json(value: Any) -> Iterable[Dict[str, Any]]:
     if isinstance(value, dict):
         yield value
+
         for child in value.values():
             yield from walk_json(child)
+
     elif isinstance(value, list):
         for child in value:
             yield from walk_json(child)
@@ -184,6 +191,7 @@ def extract_from_json_data(
             or obj.get("webUrl")
             or obj.get("canonicalUrl")
         )
+
         title_value = (
             obj.get("name")
             or obj.get("title")
@@ -192,14 +200,26 @@ def extract_from_json_data(
         )
 
         if isinstance(url_value, str) and isinstance(title_value, str):
-            add_item(items, source_url, url_value, title_value)
+            add_item(
+                items,
+                source_url,
+                url_value,
+                title_value,
+            )
 
         item = obj.get("item")
+
         if isinstance(item, dict):
             nested_url = item.get("url")
             nested_title = item.get("name") or item.get("title")
+
             if isinstance(nested_url, str) and isinstance(nested_title, str):
-                add_item(items, source_url, nested_url, nested_title)
+                add_item(
+                    items,
+                    source_url,
+                    nested_url,
+                    nested_title,
+                )
 
 
 def extract_from_html(
@@ -209,6 +229,7 @@ def extract_from_html(
 ) -> None:
     for link in soup.find_all("a", href=True):
         href = str(link.get("href", "")).strip()
+
         if not href:
             continue
 
@@ -216,32 +237,48 @@ def extract_from_html(
 
         for attribute in ("aria-label", "title", "data-title"):
             value = link.get(attribute)
+
             if isinstance(value, str):
                 candidates.append(value)
 
         visible_text = link.get_text(" ", strip=True)
+
         if visible_text:
             candidates.append(visible_text)
 
         image = link.find("img")
+
         if image is not None:
             for attribute in ("alt", "title"):
                 value = image.get(attribute)
+
                 if isinstance(value, str):
                     candidates.append(value)
 
         container = link.find_parent(["article", "li"])
+
         if container is not None:
             container_text = container.get_text(" ", strip=True)
+
             if container_text:
                 candidates.append(container_text)
 
         title = max(
-            (normalize_text(candidate) for candidate in candidates if candidate),
+            (
+                normalize_text(candidate)
+                for candidate in candidates
+                if candidate
+            ),
             key=len,
             default="",
         )
-        add_item(items, source_url, href, title)
+
+        add_item(
+            items,
+            source_url,
+            href,
+            title,
+        )
 
 
 async def extract_items(url: str) -> List[Dict[str, str]]:
@@ -260,13 +297,27 @@ async def extract_items(url: str) -> List[Dict[str, str]]:
         len(response.text),
     )
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    all_links = soup.find_all("a", href=True)
-    log.info("FONTE links_found=%s", len(all_links))
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
+    all_links = soup.find_all(
+        "a",
+        href=True,
+    )
+
+    log.info(
+        "FONTE links_found=%s",
+        len(all_links),
+    )
 
     items: Dict[str, Dict[str, str]] = {}
 
-    for script in soup.find_all("script", type="application/ld+json"):
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json",
+    ):
         try:
             if script.string:
                 extract_from_json_data(
@@ -274,10 +325,15 @@ async def extract_items(url: str) -> List[Dict[str, str]]:
                     str(response.url),
                     items,
                 )
+
         except (json.JSONDecodeError, TypeError):
             continue
 
-    next_data = soup.find("script", id="__NEXT_DATA__")
+    next_data = soup.find(
+        "script",
+        id="__NEXT_DATA__",
+    )
+
     if next_data is not None and next_data.string:
         try:
             extract_from_json_data(
@@ -285,39 +341,88 @@ async def extract_items(url: str) -> List[Dict[str, str]]:
                 str(response.url),
                 items,
             )
-        except json.JSONDecodeError:
-            log.warning("__NEXT_DATA__ presente ma non leggibile.")
 
-    extract_from_html(soup, str(response.url), items)
-    log.info("TITOLI CAMPIONE=%s",[a.get_text(" ",strip=True)[:100]for a in soup.find_all("a",href=True)[:20]])
-    log.info("FONTE matched_items=%s", len(items))
+        except json.JSONDecodeError:
+            log.warning(
+                "__NEXT_DATA__ presente ma non leggibile."
+            )
+
+    extract_from_html(
+        soup,
+        str(response.url),
+        items,
+    )
+
+    log.info(
+        "FONTE matched_items=%s",
+        len(items),
+    )
+
     return list(items.values())
 
 
-async def scan_once(application: Application) -> int:
+async def scan_once(
+    application: Application,
+) -> int:
     if not SOURCE_URLS:
-        log.warning("Nessuna SOURCE_URL configurata.")
+        log.warning(
+            "Nessuna SOURCE_URL configurata."
+        )
         return 0
 
-    state = load_json(STATE_FILE, {"seen": []})
-    seen = set(state.get("seen", []))
+    state = load_json(
+        STATE_FILE,
+        {"seen": []},
+    )
+
+    seen = set(
+        state.get("seen", [])
+    )
+
     new_items: List[Dict[str, str]] = []
 
     for source_url in SOURCE_URLS:
         try:
-            extracted_items = await extract_items(source_url)
-            for item in extracted_items:
-                seen.add(item["id"])
-                new_items.append(item)
-        except Exception as exc:
-            log.exception("Errore fonte %s: %s", source_url, exc)
+            extracted_items = await extract_items(
+                source_url
+            )
 
-    save_json(STATE_FILE, {"seen": list(seen)[-5000:]})
+            for item in extracted_items:
+                if item["id"] not in seen:
+                    seen.add(
+                        item["id"]
+                    )
+                    new_items.append(
+                        item
+                    )
+
+        except Exception as exc:
+            log.exception(
+                "Errore fonte %s: %s",
+                source_url,
+                exc,
+            )
+
+    save_json(
+        STATE_FILE,
+        {
+            "seen": list(seen)[-5000:]
+        },
+    )
 
     for item in new_items[:30]:
-        safe_title = html.escape(item["title"])
-        safe_matched = html.escape(item["matched"])
-        safe_url = html.escape(item["url"], quote=True)
+        safe_title = html.escape(
+            item["title"]
+        )
+
+        safe_matched = html.escape(
+            item["matched"]
+        )
+
+        safe_url = html.escape(
+            item["url"],
+            quote=True,
+        )
 
         message = (
             "🔔 <b>NUOVO ANNUNCIO POTENZIALE</b>\n\n"
@@ -335,17 +440,31 @@ async def scan_once(application: Application) -> int:
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
+
             except Exception as exc:
-                log.warning("Invio fallito verso %s: %s", chat_id, exc)
+                log.warning(
+                    "Invio fallito verso %s: %s",
+                    chat_id,
+                    exc,
+                )
 
     return len(new_items)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None or update.message is None:
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.effective_chat is None:
         return
 
-    add_subscriber(update.effective_chat.id)
+    if update.message is None:
+        return
+
+    add_subscriber(
+        update.effective_chat.id
+    )
+
     await update.message.reply_text(
         "✅ Radar Affari attivato.\n\n"
         "/status - mostra lo stato\n"
@@ -356,7 +475,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
@@ -368,7 +490,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def test(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
@@ -378,51 +503,91 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scan(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
-    await update.message.reply_text("🔎 Controllo in corso…")
-    count = await scan_once(context.application)
+    await update.message.reply_text(
+        "🔎 Controllo in corso…"
+    )
+
+    count = await scan_once(
+        context.application
+    )
+
     await update.message.reply_text(
         "✅ Controllo terminato.\n"
         f"Nuovi elementi trovati: {count}"
     )
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def reset(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     if update.message is None:
         return
 
-    save_json(STATE_FILE, {"seen": []})
+    save_json(
+        STATE_FILE,
+        {"seen": []},
+    )
+
     await update.message.reply_text(
         "♻️ Memoria degli annunci azzerata.\n"
         "Ora invia /scan per ripetere il test."
     )
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None or update.message is None:
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.effective_chat is None:
         return
 
-    remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text("🔕 Avvisi disattivati.")
+    if update.message is None:
+        return
+
+    remove_subscriber(
+        update.effective_chat.id
+    )
+
+    await update.message.reply_text(
+        "🔕 Avvisi disattivati."
+    )
 
 
-async def scan_loop(application: Application) -> None:
+async def scan_loop(
+    application: Application,
+) -> None:
     await asyncio.sleep(10)
 
     while True:
         try:
-            await scan_once(application)
+            await scan_once(
+                application
+            )
+
         except Exception:
-            log.exception("Errore durante la scansione automatica")
+            log.exception(
+                "Errore durante la scansione automatica"
+            )
 
-        await asyncio.sleep(CHECK_MINUTES * 60)
+        await asyncio.sleep(
+            CHECK_MINUTES * 60
+        )
 
 
-async def post_init(application: Application) -> None:
-    application.create_task(scan_loop(application))
+async def post_init(
+    application: Application,
+) -> None:
+    application.create_task(
+        scan_loop(application)
+    )
 
 
 def main() -> None:
@@ -439,12 +604,47 @@ def main() -> None:
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("test", test))
-    application.add_handler(CommandHandler("scan", scan))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "test",
+            test,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "reset",
+            reset,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stop",
+            stop,
+        )
+    )
 
     log.info(
         "Avvio Radar Affari AI: %s fonti, %s parole chiave.",
@@ -452,7 +652,9 @@ def main() -> None:
         len(KEYWORDS),
     )
 
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
