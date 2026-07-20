@@ -289,7 +289,7 @@ async def extract_items(url: str) -> List[Dict[str, str]]:
             log.warning("__NEXT_DATA__ presente ma non leggibile.")
 
     extract_from_html(soup, str(response.url), items)
-
+    log.info("TITOLI CAMPIONE=%s",[a.get_text(" ",strip=True)[:100]for a in soup.find_all("a",href=True)[:20]])
     log.info("FONTE matched_items=%s", len(items))
     return list(items.values())
 
