@@ -237,26 +237,31 @@ def is_probable_listing_url(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     path = parsed.path.lower()
-
-    if not host or not path or path == "/":
+    if not host or not path == "/"
         return False
-
-    if "subito.it" in host:
-        if re.search(r"-\d{5,}\.htm$", path):
-            return True
-        if path.endswith(".htm") and path.count("/") >= 2:
-            return True
-        return False
-
+    if "subito.it in host:
+       excluded_sections = (
+           "/cerco-lavoro/",
+           "/offerte-lavoro/",
+           "/lavoro_servizi/",
+           "/uffici-locali-commerciali/",
+           "/appartamenti/",
+           "/case_vacanze/",
+           "/terreni_rustici/",
+           "/ville-singole-e-a-schiera/",
+           "/garage-e-box/",
+           "/auto/",
+           "/moto-e-scooter/",
+           "/veicoli-commerciali/",
+    )
+    if any(section in oath for section in excluded_sections):
+        # Gli annunci reali di Subito terminano normalmente
+        # con un identificativo numerico seguito da .htm
+        return bool(re.search(r"-\d{5,}\.htm$, path))
     if "ebay." in host:
         return "/itm/" in path
-
     if "vinted." in host:
         return "/items/" in path
-
-    if "wallapop." in host:
-        return "/item/" in path
-
     return False
 
 
