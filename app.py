@@ -203,21 +203,7 @@ def parse_price(value: Any) -> Optional[float]:
     if context_values:
         return context_values[-1]
 
-    generic_matches = re.findall(
-        rf"(?<!\d){number_pattern}(?!\d)",
-        text,
-    )
-
-    generic_values = [
-        number
-        for raw in generic_matches
-        if (number := convert_number(raw)) is not None
-    ]
-
-    if not generic_values:
-        return None
-
-    return max(generic_values)
+    return None
 
 def title_from_url(url: str) -> str:
     path = urlparse(url).path
@@ -235,33 +221,42 @@ def matching_keywords(text: str) -> List[str]:
 
 def is_probable_listing_url(url: str) -> bool:
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    path = parsed.path.lower()
-    if not host or not path == "/":
+    host = parsed.netloc.lower().split(":")[0]
+    path = parsed.path.lower().rstrip("/")
+
+    if not host or not path:
         return False
+
     if "subito.it" in host:
-       excluded_sections = (
-           "/cerco-lavoro/",
-           "/offerte-lavoro/",
-           "/lavoro_servizi/",
-           "/uffici-locali-commerciali/",
-           "/appartamenti/",
-           "/case_vacanze/",
-           "/terreni_rustici/",
-           "/ville-singole-e-a-schiera/",
-           "/garage-e-box/",
-           "/auto/",
-           "/moto-e-scooter/",
-           "/veicoli-commerciali/",
-    )
-    if any(section in path for section in excluded_sections):
-        # Gli annunci reali di Subito terminano normalmente
-        # con un identificativo numerico seguito da .htm
-        return bool(re.search(r"-\d{5,}\.htm$", path))
+        excluded_sections = (
+            "/cerco-lavoro/",
+            "/offerte-lavoro/",
+            "/lavoro-servizi/",
+            "/lavoro_servizi/",
+            "/uffici-locali-commerciali/",
+            "/appartamenti/",
+            "/case-vacanze/",
+            "/case_vacanze/",
+            "/terreni-rustici/",
+            "/terreni_rustici/",
+            "/ville-singole-e-a-schiera/",
+            "/garage-e-box/",
+            "/auto/",
+            "/moto-e-scooter/",
+            "/veicoli-commerciali/",
+        )
+
+        if any(section in f"{path}/" for section in excluded_sections):
+            return False
+
+        return bool(re.search(r"-\d{5,}\.html?$", path))
+
     if "ebay." in host:
         return "/itm/" in path
+
     if "vinted." in host:
         return "/items/" in path
+
     return False
 
 
@@ -616,9 +611,10 @@ async def extract_items(url: str) -> List[Dict[str, Any]]:
 
     for sample in all_items[:5]:
         log.info(
-            "CAMPIONE title=%s price=%s url=%s",
+            "CAMPIONE title=%s price=%s matched=%s url=%s",
             sample.get("title"),
             sample.get("price"),
+            sample.get("matched"),
             sample.get("url"),
         )
 
@@ -757,7 +753,7 @@ def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
     if risk["level"] == "MEDIO":
         return "TRATTA: MARGINE VALIDO, SERVONO VERIFICHE"
 
-    return "COMPRA: CONTATTARE SUBITO"
+    return "CANDIDATO: CONTATTARE E VERIFICARE"
 
 
 def euro(value: Optional[float]) -> str:
@@ -790,7 +786,7 @@ def build_message(item: Dict[str, Any]) -> str:
     score = opportunity_score(item)
 
     return (
-        "🚨 <b>AFFARE VALIDATO</b>\n\n"
+        "🚨 <b>AFFARE CANDIDATO</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
         f"📊 Valore medio stimato: <b>{euro(item.get('market_value'))}</b>\n"
@@ -804,8 +800,8 @@ def build_message(item: Dict[str, Any]) -> str:
         f"🔑 Parole trovate: {matched}\n\n"
         f"🚦 <b>VERDETTO: {html.escape(verdict)}</b>\n\n"
         f'<a href="{url}">APRI SUBITO L’ANNUNCIO</a>\n\n'
-        "Prima di comprare: prova completa, verifica identità del venditore, "
-        "numero seriale, provenienza e disponibilità dei ricambi."
+        "Non acquistare senza verifica manuale: prova completa, identità del venditore, "
+        "numero seriale, provenienza, ricambi e prezzo reale di rivendita."
     )
 
 
