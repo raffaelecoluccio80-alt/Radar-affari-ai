@@ -383,7 +383,8 @@ def add_item(
         return
 
     item_id = create_item_id(absolute_url)
-    price = candidate_price if candidate_price is not None else parse_price(full_text)
+    text_price = parse_price(full_text)
+    price = text_price if text_price is not None else candidate_price
 
     current = items.get(item_id)
 
@@ -1054,7 +1055,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 
