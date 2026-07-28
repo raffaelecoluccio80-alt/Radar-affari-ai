@@ -30,15 +30,21 @@ log = logging.getLogger("radar-affari")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHECK_MINUTES = max(int(os.getenv("CHECK_MINUTES", "15")), 5)
 
+# Regole economiche ufficiali di Radar Affari
+MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
+MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
+MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
+
 KEYWORDS = [
     value.strip().lower()
     for value in os.getenv(
         "KEYWORDS",
         (
             "hilti,festool,makita,bosch professional,leica,topcon,trimble,"
-            "bici elettrica,ebike,haibike,cube,specialized,trek,faema,"
-            "la marzocco,rational,berkel,abbattitore,impastatrice,"
-            "dyson,folletto,iphone,ipad,macbook,playstation,xbox,nintendo switch"
+            "bici elettrica,ebike,engwe,ado,haibike,cube,specialized,trek,"
+            "faema,la marzocco,rational,berkel,abbattitore,impastatrice,"
+            "dyson,folletto,iphone,ipad,macbook,playstation,ps5,xbox,"
+            "nintendo switch"
         ),
     ).split(",")
     if value.strip()
@@ -126,32 +132,92 @@ def create_item_id(url: str) -> str:
 
 
 def parse_price(value: Any) -> Optional[float]:
+    """
+    Estrae il prezzo dell'annuncio dando priorità ai valori associati
+    al simbolo € o alla parola "euro".
+
+    Esempio:
+    "5 MacBook Air blu mezzanotte 550 €" -> 550
+    """
     if value is None:
         return None
 
     if isinstance(value, (int, float)):
-        return float(value) if float(value) > 0 else None
+        number = float(value)
+        return number if 5 <= number <= 500000 else None
 
     text = normalize_text(str(value))
     if not text:
         return None
 
     text = text.replace("\u00a0", " ")
-    matches = re.findall(r"(?<!\d)(\d{1,3}(?:[.\s]\d{3})*|\d+)(?:,\d{1,2})?\s*€?", text)
 
-    values: List[float] = []
-    for match in matches:
-        cleaned = match.replace(".", "").replace(" ", "")
+    def convert_number(raw: str) -> Optional[float]:
+        cleaned = raw.strip().replace(" ", "")
+
+        if "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", cleaned):
+            cleaned = cleaned.replace(".", "")
+
         try:
             number = float(cleaned)
         except ValueError:
-            continue
+            return None
 
-        if 5 <= number <= 500000:
-            values.append(number)
+        return number if 5 <= number <= 500000 else None
 
-    return values[0] if values else None
+    number_pattern = (
+        r"(\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?"
+        r"|\d+(?:,\d{1,2})?)"
+    )
 
+    euro_matches = re.findall(
+        rf"(?<!\d){number_pattern}\s*(?:€|euro\b)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    euro_values = [
+        number
+        for raw in euro_matches
+        if (number := convert_number(raw)) is not None
+    ]
+
+    if euro_values:
+        return euro_values[-1]
+
+    context_matches = re.findall(
+        rf"(?:prezzo|richiesta|chiedo|vendo\s+a|vendita\s+a|"
+        rf"a\s+soli|offerta)\s*[:\-]?\s*{number_pattern}",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    context_values = [
+        number
+        for raw in context_matches
+        if (number := convert_number(raw)) is not None
+    ]
+
+    if context_values:
+        return context_values[-1]
+
+    generic_matches = re.findall(
+        rf"(?<!\d){number_pattern}(?!\d)",
+        text,
+    )
+
+    generic_values = [
+        number
+        for raw in generic_matches
+        if (number := convert_number(raw)) is not None
+    ]
+
+    if not generic_values:
+        return None
+
+    return max(generic_values)
 
 def title_from_url(url: str) -> str:
     path = urlparse(url).path
@@ -235,11 +301,10 @@ def risk_analysis(text: str) -> Dict[str, Any]:
     else:
         level = "BASSO"
 
-    reasons = found_high + found_medium
     return {
         "score": score,
         "level": level,
-        "reasons": reasons[:4],
+        "reasons": (found_high + found_medium)[:4],
     }
 
 
@@ -252,6 +317,7 @@ def walk_json(value: Any) -> Iterable[Dict[str, Any]]:
         yield value
         for child in value.values():
             yield from walk_json(child)
+
     elif isinstance(value, list):
         for child in value:
             yield from walk_json(child)
@@ -266,6 +332,7 @@ def extract_price_from_object(obj: Dict[str, Any]) -> Optional[float]:
     ]
 
     offers = obj.get("offers")
+
     if isinstance(offers, dict):
         possible_values.extend(
             [
@@ -312,15 +379,14 @@ def add_item(
     combined_text = normalize_text(f"{title} {full_text}")
     matched = matching_keywords(combined_text)
 
-    # Per non perdere tutti gli annunci, accettiamo anche il titolo ricavato
-    # dall'URL. Il filtro per parole chiave viene applicato successivamente.
     if len(title) < 4:
         return
 
     item_id = create_item_id(absolute_url)
-    price = candidate_price or parse_price(full_text)
+    price = candidate_price if candidate_price is not None else parse_price(full_text)
 
     current = items.get(item_id)
+
     new_item = {
         "id": item_id,
         "title": title[:180],
@@ -334,7 +400,6 @@ def add_item(
         items[item_id] = new_item
         return
 
-    # Mantiene la versione più completa dello stesso annuncio.
     if len(new_item["text"]) > len(current.get("text", "")):
         current["text"] = new_item["text"]
 
@@ -394,10 +459,12 @@ def extract_from_html(
 ) -> None:
     for link in soup.find_all("a", href=True):
         href = normalize_text(str(link.get("href", "")))
+
         if not href:
             continue
 
         absolute_url = urljoin(source_url, href)
+
         if not is_probable_listing_url(absolute_url):
             continue
 
@@ -409,10 +476,12 @@ def extract_from_html(
                 candidates.append(value)
 
         visible_text = link.get_text(" ", strip=True)
+
         if visible_text:
             candidates.append(visible_text)
 
         image = link.find("img")
+
         if image is not None:
             for attribute in ("alt", "title"):
                 value = image.get(attribute)
@@ -421,8 +490,11 @@ def extract_from_html(
 
         container = link.find_parent(["article", "li", "div"])
         container_text = ""
+
         if container is not None:
-            container_text = normalize_text(container.get_text(" ", strip=True))
+            container_text = normalize_text(
+                container.get_text(" ", strip=True)
+            )
             if container_text:
                 candidates.append(container_text)
 
@@ -433,9 +505,18 @@ def extract_from_html(
         ]
 
         title = max(title_candidates, key=len, default="")
+
         if len(title) > 180:
-            shorter = [value for value in title_candidates if len(value) <= 180]
-            title = max(shorter, key=len, default=title_from_url(absolute_url))
+            shorter = [
+                value
+                for value in title_candidates
+                if len(value) <= 180
+            ]
+            title = max(
+                shorter,
+                key=len,
+                default=title_from_url(absolute_url),
+            )
 
         add_item(
             items=items,
@@ -455,84 +536,97 @@ async def extract_items(url: str) -> List[Dict[str, Any]]:
         response = await client.get(url)
         response.raise_for_status()
 
-        final_url = str(response.url)
+    final_url = str(response.url)
 
+    log.info(
+        "FONTE final_url=%s status=%s chars=%s",
+        final_url,
+        response.status_code,
+        len(response.text),
+    )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    all_links = soup.find_all("a", href=True)
+
+    log.info("FONTE links_found=%s", len(all_links))
+
+    items: Dict[str, Dict[str, Any]] = {}
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            raw = script.string or script.get_text()
+            if raw:
+                extract_from_json_data(
+                    json.loads(raw),
+                    final_url,
+                    items,
+                )
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    next_data = soup.find("script", id="__NEXT_DATA__")
+
+    if next_data is not None:
+        try:
+            raw = next_data.string or next_data.get_text()
+            if raw:
+                extract_from_json_data(
+                    json.loads(raw),
+                    final_url,
+                    items,
+                )
+        except json.JSONDecodeError:
+            log.warning("__NEXT_DATA__ presente ma non leggibile.")
+
+    for script in soup.find_all("script"):
+        raw = script.string or ""
+
+        if not raw or len(raw) > 2_000_000:
+            continue
+
+        if '"url"' not in raw and '"itemUrl"' not in raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        extract_from_json_data(data, final_url, items)
+
+    extract_from_html(soup, final_url, items)
+
+    all_items = list(items.values())
+
+    log.info("FONTE extracted_listings=%s", len(all_items))
+
+    filtered = [
+        item
+        for item in all_items
+        if item.get("matched")
+    ]
+
+    log.info("FONTE keyword_matched_items=%s", len(filtered))
+
+    for sample in all_items[:5]:
         log.info(
-            "FONTE final_url=%s status=%s chars=%s",
-            final_url,
-            response.status_code,
-            len(response.text),
+            "CAMPIONE title=%s price=%s url=%s",
+            sample.get("title"),
+            sample.get("price"),
+            sample.get("url"),
         )
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        all_links = soup.find_all("a", href=True)
-        log.info("FONTE links_found=%s", len(all_links))
-
-        items: Dict[str, Dict[str, Any]] = {}
-
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                raw = script.string or script.get_text()
-                if raw:
-                    extract_from_json_data(json.loads(raw), final_url, items)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        next_data = soup.find("script", id="__NEXT_DATA__")
-        if next_data is not None:
-            try:
-                raw = next_data.string or next_data.get_text()
-                if raw:
-                    extract_from_json_data(json.loads(raw), final_url, items)
-            except json.JSONDecodeError:
-                log.warning("__NEXT_DATA__ presente ma non leggibile.")
-
-        # Cerca anche oggetti JSON inclusi in altri script.
-        for script in soup.find_all("script"):
-            raw = script.string or ""
-            if not raw or len(raw) > 2_000_000:
-                continue
-            if '"url"' not in raw and '"itemUrl"' not in raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            extract_from_json_data(data, final_url, items)
-
-        extract_from_html(soup, final_url, items)
-
-        all_items = list(items.values())
-        log.info("FONTE extracted_listings=%s", len(all_items))
-
-        # Se esistono parole chiave, invia solo gli annunci coerenti.
-        filtered = [
-            item
-            for item in all_items
-            if item.get("matched")
-        ]
-
-        log.info("FONTE keyword_matched_items=%s", len(filtered))
-
-        # Diagnostica utile nei log.
-        for sample in all_items[:5]:
-            log.info(
-                "CAMPIONE title=%s price=%s url=%s",
-                sample.get("title"),
-                sample.get("price"),
-                sample.get("url"),
-            )
-
-        return filtered
+    return filtered
 
 
 # ============================================================
-# ANALISI ECONOMICA PRELIMINARE
+# ANALISI ECONOMICA
 # ============================================================
 
 def estimate_market_values(items: List[Dict[str, Any]]) -> None:
     priced_items = [
-        item for item in items
+        item
+        for item in items
         if isinstance(item.get("price"), (int, float))
     ]
 
@@ -540,32 +634,96 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
 
     for item in priced_items:
         for keyword in item.get("matched", []):
-            keyword_prices.setdefault(keyword, []).append(float(item["price"]))
+            keyword_prices.setdefault(keyword, []).append(
+                float(item["price"])
+            )
 
     for item in items:
         price = item.get("price")
         matched = item.get("matched", [])
 
         comparable_prices: List[float] = []
+
         for keyword in matched:
-            comparable_prices.extend(keyword_prices.get(keyword, []))
+            comparable_prices.extend(
+                keyword_prices.get(keyword, [])
+            )
 
         if price is None or len(comparable_prices) < 3:
             item["market_value"] = None
+            item["quick_sale_value"] = None
+            item["estimated_costs"] = None
             item["estimated_margin"] = None
             item["roi"] = None
             continue
 
         market_value = float(median(comparable_prices))
         quick_sale_value = market_value * 0.90
+
+        # Fondo prudenziale: almeno 20 €, oppure 5% del prezzo.
         estimated_costs = max(20.0, float(price) * 0.05)
-        estimated_margin = quick_sale_value - float(price) - estimated_costs
-        roi = (estimated_margin / float(price) * 100) if float(price) > 0 else 0
+
+        estimated_margin = (
+            quick_sale_value
+            - float(price)
+            - estimated_costs
+        )
+
+        roi = (
+            estimated_margin / float(price) * 100
+            if float(price) > 0
+            else 0
+        )
 
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
+        item["estimated_costs"] = round(estimated_costs, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
+
+
+def is_valid_deal(item: Dict[str, Any]) -> bool:
+    risk = risk_analysis(
+        f"{item.get('title', '')} {item.get('text', '')}"
+    )
+
+    margin = item.get("estimated_margin")
+    roi = item.get("roi")
+
+    if margin is None or roi is None:
+        return False
+
+    return (
+        float(margin) >= MIN_MARGIN_EURO
+        and float(roi) >= MIN_ROI_PERCENT
+        and risk["level"] != "ALTO"
+    )
+
+
+def opportunity_score(item: Dict[str, Any]) -> float:
+    """
+    Serve soltanto per ordinare gli affari validi.
+    Il margine assoluto pesa più del prezzo basso.
+    """
+    margin = max(float(item.get("estimated_margin") or 0), 0)
+    roi = max(float(item.get("roi") or 0), 0)
+
+    risk = risk_analysis(
+        f"{item.get('title', '')} {item.get('text', '')}"
+    )
+
+    risk_penalty = {
+        "BASSO": 0,
+        "MEDIO": 15,
+        "ALTO": 100,
+    }.get(risk["level"], 30)
+
+    return round(
+        margin
+        + (roi * 2)
+        - risk_penalty,
+        2,
+    )
 
 
 def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
@@ -573,23 +731,33 @@ def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
     roi = item.get("roi")
 
     if risk["level"] == "ALTO":
-        return "SCARTA O VERIFICA MOLTO BENE"
+        return "SCARTA: RISCHIO ALTO"
 
     if margin is None or roi is None:
-        return "DA APPROFONDIRE: DATI INSUFFICIENTI"
+        return "SCARTA: DATI ECONOMICI INSUFFICIENTI"
 
-    if margin >= 100 and roi >= 20 and risk["level"] == "BASSO":
-        return "BUON AFFARE: CONTATTARE SUBITO"
+    if float(margin) < MIN_MARGIN_EURO:
+        return (
+            f"SCARTA: MARGINE INFERIORE A "
+            f"{MIN_MARGIN_EURO:.0f} €"
+        )
 
-    if margin >= 80 and roi >= 15:
-        return "INTERESSANTE: VERIFICARE E TRATTARE"
+    if float(roi) < MIN_ROI_PERCENT:
+        return (
+            f"SCARTA: ROI INFERIORE AL "
+            f"{MIN_ROI_PERCENT:.0f}%"
+        )
 
-    return "MARGINE INSUFFICIENTE"
+    if risk["level"] == "MEDIO":
+        return "TRATTA: MARGINE VALIDO, SERVONO VERIFICHE"
+
+    return "COMPRA: CONTATTARE SUBITO"
 
 
 def euro(value: Optional[float]) -> str:
     if value is None:
         return "non disponibile"
+
     return f"{value:,.0f} €".replace(",", ".")
 
 
@@ -597,31 +765,41 @@ def build_message(item: Dict[str, Any]) -> str:
     risk = risk_analysis(
         f"{item.get('title', '')} {item.get('text', '')}"
     )
+
     verdict = verdict_for(item, risk)
 
     title = html.escape(str(item.get("title", "")))
     url = html.escape(str(item.get("url", "")), quote=True)
+
     matched = ", ".join(item.get("matched", [])) or "nessuna"
     matched = html.escape(matched)
 
-    reasons = ", ".join(risk["reasons"]) if risk["reasons"] else "nessun segnale evidente"
+    reasons = (
+        ", ".join(risk["reasons"])
+        if risk["reasons"]
+        else "nessun segnale evidente"
+    )
     reasons = html.escape(reasons)
 
+    score = opportunity_score(item)
+
     return (
-        "🔎 <b>NUOVO ANNUNCIO</b>\n\n"
+        "🚨 <b>AFFARE VALIDATO</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
         f"📊 Valore medio stimato: <b>{euro(item.get('market_value'))}</b>\n"
         f"⚡ Rivendita rapida stimata: <b>{euro(item.get('quick_sale_value'))}</b>\n"
-        f"💵 Margine preliminare: <b>{euro(item.get('estimated_margin'))}</b>\n"
-        f"📈 ROI preliminare: <b>{item.get('roi', 'non disponibile')}%</b>\n\n"
+        f"🧾 Costi prudenziali: <b>{euro(item.get('estimated_costs'))}</b>\n"
+        f"💵 Margine stimato: <b>{euro(item.get('estimated_margin'))}</b>\n"
+        f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
+        f"🎯 Indice opportunità: <b>{score}</b>\n\n"
         f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n"
         f"Motivi: {reasons}\n"
         f"🔑 Parole trovate: {matched}\n\n"
         f"🚦 <b>VERDETTO: {html.escape(verdict)}</b>\n\n"
-        f'<a href="{url}">Apri annuncio</a>\n\n'
+        f'<a href="{url}">APRI SUBITO L’ANNUNCIO</a>\n\n'
         "Prima di comprare: prova completa, verifica identità del venditore, "
-        "numero seriale e provenienza."
+        "numero seriale, provenienza e disponibilità dei ricambi."
     )
 
 
@@ -636,6 +814,7 @@ async def scan_once(application: Application) -> int:
 
     state = load_json(STATE_FILE, {"seen": []})
     seen = set(state.get("seen", []))
+
     new_items: List[Dict[str, Any]] = []
 
     for source_url in SOURCE_URLS:
@@ -649,16 +828,42 @@ async def scan_once(application: Application) -> int:
                     new_items.append(item)
 
         except Exception as exc:
-            log.exception("Errore fonte %s: %s", source_url, exc)
+            log.exception(
+                "Errore fonte %s: %s",
+                source_url,
+                exc,
+            )
 
     save_json(
         STATE_FILE,
         {"seen": list(seen)[-5000:]},
     )
 
-    log.info("SCAN new_items=%s subscribers=%s", len(new_items), len(subscribers()))
+    valid_deals = [
+        item
+        for item in new_items
+        if is_valid_deal(item)
+    ]
 
-    for item in new_items[:30]:
+    # Non ordina per prezzo più basso.
+    # Prima mostra l'opportunità con più margine e miglior rendimento.
+    valid_deals.sort(
+        key=lambda item: (
+            opportunity_score(item),
+            float(item.get("estimated_margin") or 0),
+            float(item.get("roi") or 0),
+        ),
+        reverse=True,
+    )
+
+    log.info(
+        "SCAN nuovi=%s affari_validi=%s iscritti=%s",
+        len(new_items),
+        len(valid_deals),
+        len(subscribers()),
+    )
+
+    for item in valid_deals[:MAX_ALERTS_PER_SCAN]:
         message = build_message(item)
 
         for chat_id in subscribers():
@@ -669,11 +874,20 @@ async def scan_once(application: Application) -> int:
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
+
             except Exception as exc:
-                log.warning("Invio fallito verso %s: %s", chat_id, exc)
+                log.warning(
+                    "Invio fallito verso %s: %s",
+                    chat_id,
+                    exc,
+                )
 
-    return len(new_items)
+    return len(valid_deals)
 
+
+# ============================================================
+# COMANDI TELEGRAM
+# ============================================================
 
 async def start(
     update: Update,
@@ -686,6 +900,10 @@ async def start(
 
     await update.message.reply_text(
         "✅ Radar Affari attivato.\n\n"
+        f"Regole attive:\n"
+        f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
+        f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
+        f"• Priorità agli annunci con più margine\n\n"
         "/status - mostra lo stato\n"
         "/test - prova il collegamento\n"
         "/scan - esegue una scansione\n"
@@ -705,6 +923,8 @@ async def status(
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
+        f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
+        f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"👥 Iscritti: {len(subscribers())}"
     )
 
@@ -718,7 +938,9 @@ async def test(
 
     await update.message.reply_text(
         "✅ TEST RADAR\n"
-        "Collegamento Telegram ↔ applicazione funzionante."
+        "Collegamento Telegram ↔ applicazione funzionante.\n"
+        f"Filtro attivo: margine ≥ {MIN_MARGIN_EURO:.0f} € "
+        f"e ROI ≥ {MIN_ROI_PERCENT:.0f}%."
     )
 
 
@@ -729,12 +951,16 @@ async def scan(
     if update.message is None:
         return
 
-    await update.message.reply_text("🔎 Controllo in corso…")
+    await update.message.reply_text(
+        "🔎 Controllo in corso…\n"
+        "Cerco gli annunci con il margine migliore."
+    )
+
     count = await scan_once(context.application)
 
     await update.message.reply_text(
         "✅ Controllo terminato.\n"
-        f"Nuovi elementi trovati: {count}"
+        f"Affari validi trovati: {count}"
     )
 
 
@@ -761,8 +987,14 @@ async def stop(
         return
 
     remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text("🔕 Avvisi disattivati.")
+    await update.message.reply_text(
+        "🔕 Avvisi disattivati."
+    )
 
+
+# ============================================================
+# CICLO AUTOMATICO
+# ============================================================
 
 async def scan_loop(application: Application) -> None:
     await asyncio.sleep(10)
@@ -770,8 +1002,11 @@ async def scan_loop(application: Application) -> None:
     while True:
         try:
             await scan_once(application)
+
         except Exception:
-            log.exception("Errore durante la scansione automatica")
+            log.exception(
+                "Errore durante la scansione automatica"
+            )
 
         await asyncio.sleep(CHECK_MINUTES * 60)
 
@@ -802,12 +1037,19 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari AI: %s fonti, %s parole chiave.",
+        (
+            "Avvio Radar Affari AI: %s fonti, %s parole chiave, "
+            "margine minimo %.0f €, ROI minimo %.0f%%."
+        ),
         len(SOURCE_URLS),
         len(KEYWORDS),
+        MIN_MARGIN_EURO,
+        MIN_ROI_PERCENT,
     )
 
-    application.run_polling(drop_pending_updates=True)
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
