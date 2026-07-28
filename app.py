@@ -237,7 +237,7 @@ def is_probable_listing_url(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     path = parsed.path.lower()
-    if not host or not path == "/"
+    if not host or not path == "/":
         return False
     if "subito.it" in host:
        excluded_sections = (
