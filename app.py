@@ -254,7 +254,7 @@ def is_probable_listing_url(url: str) -> bool:
            "/moto-e-scooter/",
            "/veicoli-commerciali/",
     )
-    if any(section in oath for section in excluded_sections):
+    if any(section in path for section in excluded_sections):
         # Gli annunci reali di Subito terminano normalmente
         # con un identificativo numerico seguito da .htm
         return bool(re.search(r"-\d{5,}\.htm$", path))
