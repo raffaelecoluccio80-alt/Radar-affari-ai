@@ -6,9 +6,10 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -30,7 +31,6 @@ log = logging.getLogger("radar-affari")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHECK_MINUTES = max(int(os.getenv("CHECK_MINUTES", "15")), 5)
 
-# Regole economiche ufficiali di Radar Affari
 MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
 MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
 MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
@@ -56,11 +56,19 @@ SOURCE_URLS = [
     if value.strip()
 ]
 
-DATA_DIR = Path(tempfile.gettempdir()) / "radar_affari_ai"
+configured_data_dir = os.getenv("DATA_DIR", "").strip()
+if configured_data_dir:
+    DATA_DIR = Path(configured_data_dir)
+elif Path("/data").exists():
+    DATA_DIR = Path("/data/radar_affari_ai")
+else:
+    DATA_DIR = Path(tempfile.gettempdir()) / "radar_affari_ai"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_FILE = DATA_DIR / "radar_state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
+HISTORY_FILE = DATA_DIR / "radar_history.json"
 
 HEADERS = {
     "User-Agent": (
@@ -75,6 +83,8 @@ HEADERS = {
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.7",
     "Cache-Control": "no-cache",
 }
+
+SCAN_LOCK = asyncio.Lock()
 
 
 # ============================================================
@@ -132,13 +142,6 @@ def create_item_id(url: str) -> str:
 
 
 def parse_price(value: Any) -> Optional[float]:
-    """
-    Estrae il prezzo dell'annuncio dando priorità ai valori associati
-    al simbolo € o alla parola "euro".
-
-    Esempio:
-    "5 MacBook Air blu mezzanotte 550 €" -> 550
-    """
     if value is None:
         return None
 
@@ -146,11 +149,9 @@ def parse_price(value: Any) -> Optional[float]:
         number = float(value)
         return number if 5 <= number <= 500000 else None
 
-    text = normalize_text(str(value))
+    text = normalize_text(str(value)).replace("\u00a0", " ")
     if not text:
         return None
-
-    text = text.replace("\u00a0", " ")
 
     def convert_number(raw: str) -> Optional[float]:
         cleaned = raw.strip().replace(" ", "")
@@ -200,16 +201,14 @@ def parse_price(value: Any) -> Optional[float]:
         if (number := convert_number(raw)) is not None
     ]
 
-    if context_values:
-        return context_values[-1]
+    return context_values[-1] if context_values else None
 
-    return None
 
 def title_from_url(url: str) -> str:
     path = urlparse(url).path
     slug = path.rstrip("/").split("/")[-1]
-    slug = re.sub(r"-\d{5,}\.htm$", "", slug, flags=re.IGNORECASE)
-    slug = re.sub(r"\.htm$", "", slug, flags=re.IGNORECASE)
+    slug = re.sub(r"-\d{5,}\.html?$", "", slug, flags=re.IGNORECASE)
+    slug = re.sub(r"\.html?$", "", slug, flags=re.IGNORECASE)
     slug = slug.replace("-", " ").replace("_", " ")
     return normalize_text(slug)
 
@@ -217,6 +216,52 @@ def title_from_url(url: str) -> str:
 def matching_keywords(text: str) -> List[str]:
     lowered = normalize_text(text).lower()
     return [keyword for keyword in KEYWORDS if keyword in lowered]
+
+
+def identify_product(text: str) -> Dict[str, str]:
+    lowered = normalize_text(text).lower()
+
+    rules: List[Tuple[str, str, str]] = [
+        ("engwe", r"\bep[-\s]?2\s*pro\b", "EP-2 Pro"),
+        ("engwe", r"\bengine\s*pro\b", "Engine Pro"),
+        ("engwe", r"\bl20\b", "L20"),
+        ("ado", r"\ba20f\b", "A20F"),
+        ("dyson", r"\bv15\b", "V15"),
+        ("dyson", r"\bv12\b", "V12"),
+        ("dyson", r"\bv11\b", "V11"),
+        ("dyson", r"\bv10\b", "V10"),
+        ("dyson", r"\bv8\b", "V8"),
+        ("apple", r"\biphone\s*15\s*pro\s*max\b", "iPhone 15 Pro Max"),
+        ("apple", r"\biphone\s*15\s*pro\b", "iPhone 15 Pro"),
+        ("apple", r"\biphone\s*14\s*pro\s*max\b", "iPhone 14 Pro Max"),
+        ("apple", r"\biphone\s*14\s*pro\b", "iPhone 14 Pro"),
+        ("apple", r"\biphone\s*13\s*pro\s*max\b", "iPhone 13 Pro Max"),
+        ("apple", r"\biphone\s*13\s*pro\b", "iPhone 13 Pro"),
+        ("apple", r"\biphone\s*13\b", "iPhone 13"),
+        ("apple", r"\biphone\s*12\s*pro\s*max\b", "iPhone 12 Pro Max"),
+        ("apple", r"\biphone\s*12\s*pro\b", "iPhone 12 Pro"),
+        ("apple", r"\biphone\s*12\b", "iPhone 12"),
+        ("sony", r"\bps5\b|\bplaystation\s*5\b", "PlayStation 5"),
+        ("nintendo", r"\bswitch\s*oled\b", "Switch OLED"),
+    ]
+
+    for brand, pattern, model in rules:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            return {
+                "brand": brand,
+                "model": model,
+                "product_key": f"{brand}:{model}".lower(),
+            }
+
+    for keyword in KEYWORDS:
+        if keyword in lowered:
+            return {
+                "brand": keyword,
+                "model": "",
+                "product_key": keyword,
+            }
+
+    return {"brand": "", "model": "", "product_key": ""}
 
 
 def is_probable_listing_url(url: str) -> bool:
@@ -245,10 +290,8 @@ def is_probable_listing_url(url: str) -> bool:
             "/moto-e-scooter/",
             "/veicoli-commerciali/",
         )
-
         if any(section in f"{path}/" for section in excluded_sections):
             return False
-
         return bool(re.search(r"-\d{5,}\.html?$", path))
 
     if "ebay." in host:
@@ -264,42 +307,22 @@ def risk_analysis(text: str) -> Dict[str, Any]:
     lowered = normalize_text(text).lower()
 
     high_risk_terms = [
-        "non funzionante",
-        "non funziona",
-        "da riparare",
-        "da sistemare",
-        "per ricambi",
-        "rotto",
-        "guasto",
-        "non testato",
-        "non so se funziona",
-        "senza garanzia",
-        "bloccato",
-        "account bloccato",
-        "imei bloccato",
+        "non funzionante", "non funziona", "da riparare", "da sistemare",
+        "per ricambi", "rotto", "guasto", "non testato",
+        "non so se funziona", "senza garanzia", "bloccato",
+        "account bloccato", "imei bloccato",
     ]
 
     medium_risk_terms = [
-        "senza caricatore",
-        "senza batteria",
-        "manca",
-        "difetto",
-        "segni di usura",
-        "solo spedizione",
-        "visto e piaciuto",
+        "senza caricatore", "senza batteria", "manca", "difetto",
+        "segni di usura", "solo spedizione", "visto e piaciuto",
     ]
 
     found_high = [term for term in high_risk_terms if term in lowered]
     found_medium = [term for term in medium_risk_terms if term in lowered]
 
     score = min(100, len(found_high) * 35 + len(found_medium) * 15)
-
-    if found_high:
-        level = "ALTO"
-    elif found_medium:
-        level = "MEDIO"
-    else:
-        level = "BASSO"
+    level = "ALTO" if found_high else "MEDIO" if found_medium else "BASSO"
 
     return {
         "score": score,
@@ -317,7 +340,6 @@ def walk_json(value: Any) -> Iterable[Dict[str, Any]]:
         yield value
         for child in value.values():
             yield from walk_json(child)
-
     elif isinstance(value, list):
         for child in value:
             yield from walk_json(child)
@@ -332,15 +354,12 @@ def extract_price_from_object(obj: Dict[str, Any]) -> Optional[float]:
     ]
 
     offers = obj.get("offers")
-
     if isinstance(offers, dict):
-        possible_values.extend(
-            [
-                offers.get("price"),
-                offers.get("lowPrice"),
-                offers.get("highPrice"),
-            ]
-        )
+        possible_values.extend([
+            offers.get("price"),
+            offers.get("lowPrice"),
+            offers.get("highPrice"),
+        ])
 
     for value in possible_values:
         if isinstance(value, dict):
@@ -364,8 +383,7 @@ def add_item(
     candidate_text: str = "",
     candidate_price: Optional[float] = None,
 ) -> None:
-    absolute_url = urljoin(source_url, candidate_url)
-    absolute_url = absolute_url.split("#")[0]
+    absolute_url = urljoin(source_url, candidate_url).split("#")[0]
 
     if not is_probable_listing_url(absolute_url):
         return
@@ -379,34 +397,37 @@ def add_item(
     combined_text = normalize_text(f"{title} {full_text}")
     matched = matching_keywords(combined_text)
 
-    if len(title) < 4:
+    if len(title) < 4 or not matched:
         return
 
+    product = identify_product(combined_text)
     item_id = create_item_id(absolute_url)
-    text_price = parse_price(full_text)
-    price = text_price if text_price is not None else candidate_price
 
-    current = items.get(item_id)
+    text_price = parse_price(full_text)
+    price = candidate_price if candidate_price is not None else text_price
 
     new_item = {
         "id": item_id,
         "title": title[:180],
         "url": absolute_url,
-        "text": full_text[:700],
+        "text": full_text[:1000],
         "price": price,
         "matched": matched,
+        "brand": product["brand"],
+        "model": product["model"],
+        "product_key": product["product_key"],
+        "source_url": source_url,
     }
 
+    current = items.get(item_id)
     if current is None:
         items[item_id] = new_item
         return
 
     if len(new_item["text"]) > len(current.get("text", "")):
         current["text"] = new_item["text"]
-
     if len(new_item["title"]) > len(current.get("title", "")):
         current["title"] = new_item["title"]
-
     if current.get("price") is None and price is not None:
         current["price"] = price
 
@@ -460,12 +481,10 @@ def extract_from_html(
 ) -> None:
     for link in soup.find_all("a", href=True):
         href = normalize_text(str(link.get("href", "")))
-
         if not href:
             continue
 
         absolute_url = urljoin(source_url, href)
-
         if not is_probable_listing_url(absolute_url):
             continue
 
@@ -477,12 +496,10 @@ def extract_from_html(
                 candidates.append(value)
 
         visible_text = link.get_text(" ", strip=True)
-
         if visible_text:
             candidates.append(visible_text)
 
         image = link.find("img")
-
         if image is not None:
             for attribute in ("alt", "title"):
                 value = image.get(attribute)
@@ -491,11 +508,8 @@ def extract_from_html(
 
         container = link.find_parent(["article", "li", "div"])
         container_text = ""
-
         if container is not None:
-            container_text = normalize_text(
-                container.get_text(" ", strip=True)
-            )
+            container_text = normalize_text(container.get_text(" ", strip=True))
             if container_text:
                 candidates.append(container_text)
 
@@ -506,18 +520,9 @@ def extract_from_html(
         ]
 
         title = max(title_candidates, key=len, default="")
-
         if len(title) > 180:
-            shorter = [
-                value
-                for value in title_candidates
-                if len(value) <= 180
-            ]
-            title = max(
-                shorter,
-                key=len,
-                default=title_from_url(absolute_url),
-            )
+            shorter = [value for value in title_candidates if len(value) <= 180]
+            title = max(shorter, key=len, default=title_from_url(absolute_url))
 
         add_item(
             items=items,
@@ -528,167 +533,137 @@ def extract_from_html(
         )
 
 
-async def extract_items(url: str) -> List[Dict[str, Any]]:
-    async with httpx.AsyncClient(
-        headers=HEADERS,
-        follow_redirects=True,
-        timeout=30,
-    ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {
+        "url": url,
+        "status": None,
+        "links": 0,
+        "extracted": 0,
+        "priced": 0,
+        "error": "",
+    }
 
-    final_url = str(response.url)
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            timeout=30,
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
 
-    log.info(
-        "FONTE final_url=%s status=%s chars=%s",
-        final_url,
-        response.status_code,
-        len(response.text),
-    )
+        diagnostics["status"] = response.status_code
+        final_url = str(response.url)
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    all_links = soup.find_all("a", href=True)
+        soup = BeautifulSoup(response.text, "html.parser")
+        diagnostics["links"] = len(soup.find_all("a", href=True))
 
-    log.info("FONTE links_found=%s", len(all_links))
+        items: Dict[str, Dict[str, Any]] = {}
 
-    items: Dict[str, Dict[str, Any]] = {}
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                raw = script.string or script.get_text()
+                if raw:
+                    extract_from_json_data(json.loads(raw), final_url, items)
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            raw = script.string or script.get_text()
-            if raw:
-                extract_from_json_data(
-                    json.loads(raw),
-                    final_url,
-                    items,
-                )
-        except (json.JSONDecodeError, TypeError):
-            continue
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data is not None:
+            try:
+                raw = next_data.string or next_data.get_text()
+                if raw:
+                    extract_from_json_data(json.loads(raw), final_url, items)
+            except json.JSONDecodeError:
+                log.warning("__NEXT_DATA__ presente ma non leggibile.")
 
-    next_data = soup.find("script", id="__NEXT_DATA__")
+        extract_from_html(soup, final_url, items)
 
-    if next_data is not None:
-        try:
-            raw = next_data.string or next_data.get_text()
-            if raw:
-                extract_from_json_data(
-                    json.loads(raw),
-                    final_url,
-                    items,
-                )
-        except json.JSONDecodeError:
-            log.warning("__NEXT_DATA__ presente ma non leggibile.")
+        result = list(items.values())
+        diagnostics["extracted"] = len(result)
+        diagnostics["priced"] = sum(1 for item in result if item.get("price") is not None)
 
-    for script in soup.find_all("script"):
-        raw = script.string or ""
+        return result, diagnostics
 
-        if not raw or len(raw) > 2_000_000:
-            continue
-
-        if '"url"' not in raw and '"itemUrl"' not in raw:
-            continue
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-
-        extract_from_json_data(data, final_url, items)
-
-    extract_from_html(soup, final_url, items)
-
-    all_items = list(items.values())
-
-    log.info("FONTE extracted_listings=%s", len(all_items))
-
-    filtered = [
-        item
-        for item in all_items
-        if item.get("matched")
-    ]
-
-    log.info("FONTE keyword_matched_items=%s", len(filtered))
-
-    for sample in all_items[:5]:
-        log.info(
-            "CAMPIONE title=%s price=%s matched=%s url=%s",
-            sample.get("title"),
-            sample.get("price"),
-            sample.get("matched"),
-            sample.get("url"),
-        )
-
-    return filtered
+    except Exception as exc:
+        diagnostics["error"] = str(exc)
+        log.exception("Errore estrazione %s: %s", url, exc)
+        return [], diagnostics
 
 
 # ============================================================
-# ANALISI ECONOMICA
+# STORICO E ANALISI ECONOMICA
 # ============================================================
 
-def estimate_market_values(items: List[Dict[str, Any]]) -> None:
-    priced_items = [
-        item
-        for item in items
-        if isinstance(item.get("price"), (int, float))
-    ]
+def update_history(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    history = load_json(HISTORY_FILE, [])
+    existing_ids = {row.get("id") for row in history if isinstance(row, dict)}
+    now = datetime.now(timezone.utc).isoformat()
 
-    keyword_prices: Dict[str, List[float]] = {}
+    for item in items:
+        if item.get("id") in existing_ids:
+            continue
+        if not isinstance(item.get("price"), (int, float)):
+            continue
 
-    for item in priced_items:
-        for keyword in item.get("matched", []):
-            keyword_prices.setdefault(keyword, []).append(
-                float(item["price"])
-            )
+        history.append({
+            "id": item["id"],
+            "product_key": item.get("product_key") or "",
+            "brand": item.get("brand") or "",
+            "model": item.get("model") or "",
+            "price": float(item["price"]),
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "seen_at": now,
+        })
+
+    history = history[-20000:]
+    save_json(HISTORY_FILE, history)
+    return history
+
+
+def estimate_market_values(
+    items: List[Dict[str, Any]],
+    history: List[Dict[str, Any]],
+) -> None:
+    historical_prices: Dict[str, List[float]] = {}
+
+    for row in history:
+        key = str(row.get("product_key") or "").strip().lower()
+        price = row.get("price")
+        if key and isinstance(price, (int, float)):
+            historical_prices.setdefault(key, []).append(float(price))
 
     for item in items:
         price = item.get("price")
-        matched = item.get("matched", [])
+        key = str(item.get("product_key") or "").strip().lower()
+        comparable_prices = historical_prices.get(key, [])
 
-        comparable_prices: List[float] = []
-
-        for keyword in matched:
-            comparable_prices.extend(
-                keyword_prices.get(keyword, [])
-            )
-
-        if price is None or len(comparable_prices) < 3:
+        if price is None or not key or len(comparable_prices) < 3:
             item["market_value"] = None
             item["quick_sale_value"] = None
             item["estimated_costs"] = None
             item["estimated_margin"] = None
             item["roi"] = None
+            item["comparables"] = len(comparable_prices)
             continue
 
         market_value = float(median(comparable_prices))
         quick_sale_value = market_value * 0.90
-
-        # Fondo prudenziale: almeno 20 €, oppure 5% del prezzo.
         estimated_costs = max(20.0, float(price) * 0.05)
-
-        estimated_margin = (
-            quick_sale_value
-            - float(price)
-            - estimated_costs
-        )
-
-        roi = (
-            estimated_margin / float(price) * 100
-            if float(price) > 0
-            else 0
-        )
+        estimated_margin = quick_sale_value - float(price) - estimated_costs
+        roi = estimated_margin / float(price) * 100 if float(price) > 0 else 0
 
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
         item["estimated_costs"] = round(estimated_costs, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
+        item["comparables"] = len(comparable_prices)
 
 
 def is_valid_deal(item: Dict[str, Any]) -> bool:
-    risk = risk_analysis(
-        f"{item.get('title', '')} {item.get('text', '')}"
-    )
-
+    risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
     margin = item.get("estimated_margin")
     roi = item.get("roi")
 
@@ -703,29 +678,15 @@ def is_valid_deal(item: Dict[str, Any]) -> bool:
 
 
 def opportunity_score(item: Dict[str, Any]) -> float:
-    """
-    Serve soltanto per ordinare gli affari validi.
-    Il margine assoluto pesa più del prezzo basso.
-    """
     margin = max(float(item.get("estimated_margin") or 0), 0)
     roi = max(float(item.get("roi") or 0), 0)
+    risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
 
-    risk = risk_analysis(
-        f"{item.get('title', '')} {item.get('text', '')}"
+    risk_penalty = {"BASSO": 0, "MEDIO": 15, "ALTO": 100}.get(
+        risk["level"], 30
     )
 
-    risk_penalty = {
-        "BASSO": 0,
-        "MEDIO": 15,
-        "ALTO": 100,
-    }.get(risk["level"], 30)
-
-    return round(
-        margin
-        + (roi * 2)
-        - risk_penalty,
-        2,
-    )
+    return round(margin + (roi * 2) - risk_penalty, 2)
 
 
 def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
@@ -734,74 +695,52 @@ def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
 
     if risk["level"] == "ALTO":
         return "SCARTA: RISCHIO ALTO"
-
     if margin is None or roi is None:
         return "SCARTA: DATI ECONOMICI INSUFFICIENTI"
-
     if float(margin) < MIN_MARGIN_EURO:
-        return (
-            f"SCARTA: MARGINE INFERIORE A "
-            f"{MIN_MARGIN_EURO:.0f} €"
-        )
-
+        return f"SCARTA: MARGINE INFERIORE A {MIN_MARGIN_EURO:.0f} €"
     if float(roi) < MIN_ROI_PERCENT:
-        return (
-            f"SCARTA: ROI INFERIORE AL "
-            f"{MIN_ROI_PERCENT:.0f}%"
-        )
-
+        return f"SCARTA: ROI INFERIORE AL {MIN_ROI_PERCENT:.0f}%"
     if risk["level"] == "MEDIO":
         return "TRATTA: MARGINE VALIDO, SERVONO VERIFICHE"
-
     return "CANDIDATO: CONTATTARE E VERIFICARE"
 
 
 def euro(value: Optional[float]) -> str:
     if value is None:
         return "non disponibile"
-
     return f"{value:,.0f} €".replace(",", ".")
 
 
 def build_message(item: Dict[str, Any]) -> str:
-    risk = risk_analysis(
-        f"{item.get('title', '')} {item.get('text', '')}"
-    )
-
+    risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
     verdict = verdict_for(item, risk)
 
     title = html.escape(str(item.get("title", "")))
     url = html.escape(str(item.get("url", "")), quote=True)
+    product_name = " ".join(
+        part for part in [item.get("brand", ""), item.get("model", "")] if part
+    ) or "non identificato"
 
-    matched = ", ".join(item.get("matched", [])) or "nessuna"
-    matched = html.escape(matched)
-
-    reasons = (
-        ", ".join(risk["reasons"])
-        if risk["reasons"]
-        else "nessun segnale evidente"
-    )
-    reasons = html.escape(reasons)
-
-    score = opportunity_score(item)
+    reasons = ", ".join(risk["reasons"]) if risk["reasons"] else "nessun segnale evidente"
 
     return (
         "🚨 <b>AFFARE CANDIDATO</b>\n\n"
-        f"<b>{title}</b>\n\n"
+        f"<b>{title}</b>\n"
+        f"🧩 Prodotto: <b>{html.escape(product_name)}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
         f"📊 Valore medio stimato: <b>{euro(item.get('market_value'))}</b>\n"
         f"⚡ Rivendita rapida stimata: <b>{euro(item.get('quick_sale_value'))}</b>\n"
         f"🧾 Costi prudenziali: <b>{euro(item.get('estimated_costs'))}</b>\n"
         f"💵 Margine stimato: <b>{euro(item.get('estimated_margin'))}</b>\n"
         f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
-        f"🎯 Indice opportunità: <b>{score}</b>\n\n"
+        f"📚 Confronti disponibili: <b>{item.get('comparables', 0)}</b>\n"
+        f"🎯 Indice opportunità: <b>{opportunity_score(item)}</b>\n\n"
         f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n"
-        f"Motivi: {reasons}\n"
-        f"🔑 Parole trovate: {matched}\n\n"
+        f"Motivi: {html.escape(reasons)}\n\n"
         f"🚦 <b>VERDETTO: {html.escape(verdict)}</b>\n\n"
         f'<a href="{url}">APRI SUBITO L’ANNUNCIO</a>\n\n'
-        "Non acquistare senza verifica manuale: prova completa, identità del venditore, "
-        "numero seriale, provenienza, ricambi e prezzo reale di rivendita."
+        "Non acquistare senza verifica manuale."
     )
 
 
@@ -809,92 +748,107 @@ def build_message(item: Dict[str, Any]) -> str:
 # SCANSIONE E TELEGRAM
 # ============================================================
 
-async def scan_once(application: Application) -> int:
-    if not SOURCE_URLS:
-        log.warning("Nessuna SOURCE_URL configurata.")
-        return 0
+async def scan_once(application: Application) -> Dict[str, Any]:
+    if SCAN_LOCK.locked():
+        return {
+            "busy": True,
+            "new": 0,
+            "valid": 0,
+            "diagnostics": [],
+        }
 
-    state = load_json(STATE_FILE, {"seen": []})
-    seen = set(state.get("seen", []))
+    async with SCAN_LOCK:
+        if not SOURCE_URLS:
+            log.warning("Nessuna SOURCE_URL configurata.")
+            return {
+                "busy": False,
+                "new": 0,
+                "valid": 0,
+                "diagnostics": [],
+            }
 
-    new_items: List[Dict[str, Any]] = []
+        state = load_json(STATE_FILE, {"observed": [], "notified": []})
+        observed = set(state.get("observed", []))
+        notified = set(state.get("notified", []))
 
-    for source_url in SOURCE_URLS:
-        try:
-            extracted_items = await extract_items(source_url)
-            estimate_market_values(extracted_items)
+        all_extracted: List[Dict[str, Any]] = []
+        new_items: List[Dict[str, Any]] = []
+        diagnostics: List[Dict[str, Any]] = []
+
+        for source_url in SOURCE_URLS:
+            extracted_items, source_diagnostics = await extract_items(source_url)
+            diagnostics.append(source_diagnostics)
+            all_extracted.extend(extracted_items)
 
             for item in extracted_items:
-                if item["id"] not in seen:
-                    seen.add(item["id"])
+                if item["id"] not in observed:
+                    observed.add(item["id"])
                     new_items.append(item)
 
-        except Exception as exc:
-            log.exception(
-                "Errore fonte %s: %s",
-                source_url,
-                exc,
-            )
+        history = update_history(all_extracted)
+        estimate_market_values(new_items, history)
 
-    save_json(
-        STATE_FILE,
-        {"seen": list(seen)[-5000:]},
-    )
+        valid_deals = [
+            item for item in new_items
+            if item["id"] not in notified and is_valid_deal(item)
+        ]
 
-    valid_deals = [
-        item
-        for item in new_items
-        if is_valid_deal(item)
-    ]
+        valid_deals.sort(
+            key=lambda item: (
+                opportunity_score(item),
+                float(item.get("estimated_margin") or 0),
+                float(item.get("roi") or 0),
+            ),
+            reverse=True,
+        )
 
-    # Non ordina per prezzo più basso.
-    # Prima mostra l'opportunità con più margine e miglior rendimento.
-    valid_deals.sort(
-        key=lambda item: (
-            opportunity_score(item),
-            float(item.get("estimated_margin") or 0),
-            float(item.get("roi") or 0),
-        ),
-        reverse=True,
-    )
+        for item in valid_deals[:MAX_ALERTS_PER_SCAN]:
+            message = build_message(item)
+            sent_to_at_least_one = False
 
-    log.info(
-        "SCAN nuovi=%s affari_validi=%s iscritti=%s",
-        len(new_items),
-        len(valid_deals),
-        len(subscribers()),
-    )
+            for chat_id in subscribers():
+                try:
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    sent_to_at_least_one = True
+                except Exception as exc:
+                    log.warning("Invio fallito verso %s: %s", chat_id, exc)
 
-    for item in valid_deals[:MAX_ALERTS_PER_SCAN]:
-        message = build_message(item)
+            if sent_to_at_least_one:
+                notified.add(item["id"])
 
-        for chat_id in subscribers():
-            try:
-                await application.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+        save_json(
+            STATE_FILE,
+            {
+                "observed": list(observed)[-10000:],
+                "notified": list(notified)[-5000:],
+            },
+        )
 
-            except Exception as exc:
-                log.warning(
-                    "Invio fallito verso %s: %s",
-                    chat_id,
-                    exc,
-                )
+        log.info(
+            "SCAN nuovi=%s affari_validi=%s iscritti=%s",
+            len(new_items),
+            len(valid_deals),
+            len(subscribers()),
+        )
 
-    return len(valid_deals)
+        return {
+            "busy": False,
+            "new": len(new_items),
+            "valid": len(valid_deals),
+            "diagnostics": diagnostics,
+        }
 
 
 # ============================================================
 # COMANDI TELEGRAM
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.message is None:
         return
 
@@ -902,24 +856,23 @@ async def start(
 
     await update.message.reply_text(
         "✅ Radar Affari attivato.\n\n"
-        f"Regole attive:\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
-        f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
-        f"• Priorità agli annunci con più margine\n\n"
-        "/status - mostra lo stato\n"
-        "/test - prova il collegamento\n"
-        "/scan - esegue una scansione\n"
-        "/reset - dimentica gli annunci già visti\n"
-        "/stop - disattiva gli avvisi"
+        f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n\n"
+        "/status - stato del radar\n"
+        "/fonti - diagnostica delle fonti\n"
+        "/test - prova Telegram\n"
+        "/scan - scansione manuale\n"
+        "/reset - azzera memoria annunci\n"
+        "/stop - disattiva avvisi"
     )
 
 
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
+
+    history = load_json(HISTORY_FILE, [])
+    state = load_json(STATE_FILE, {"observed": [], "notified": []})
 
     await update.message.reply_text(
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
@@ -927,71 +880,93 @@ async def status(
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
         f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
-        f"👥 Iscritti: {len(subscribers())}"
+        f"📚 Prezzi nello storico: {len(history)}\n"
+        f"👁 Annunci osservati: {len(state.get('observed', []))}\n"
+        f"🔔 Annunci notificati: {len(state.get('notified', []))}\n"
+        f"👥 Iscritti: {len(subscribers())}\n"
+        f"💾 Cartella dati: {DATA_DIR}"
     )
 
 
-async def test(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
     await update.message.reply_text(
         "✅ TEST RADAR\n"
-        "Collegamento Telegram ↔ applicazione funzionante.\n"
-        f"Filtro attivo: margine ≥ {MIN_MARGIN_EURO:.0f} € "
-        f"e ROI ≥ {MIN_ROI_PERCENT:.0f}%."
+        "Collegamento Telegram ↔ applicazione funzionante."
     )
 
 
-async def scan(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    await update.message.reply_text(
-        "🔎 Controllo in corso…\n"
-        "Cerco gli annunci con il margine migliore."
-    )
+    await update.message.reply_text("🔎 Controllo in corso…")
+    result = await scan_once(context.application)
 
-    count = await scan_once(context.application)
+    if result["busy"]:
+        await update.message.reply_text(
+            "⏳ Una scansione è già in corso. Riprova tra poco."
+        )
+        return
 
     await update.message.reply_text(
         "✅ Controllo terminato.\n"
-        f"Affari validi trovati: {count}"
+        f"Nuovi annunci: {result['new']}\n"
+        f"Affari validi: {result['valid']}"
     )
 
 
-async def reset(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    save_json(STATE_FILE, {"seen": []})
+    if not SOURCE_URLS:
+        await update.message.reply_text(
+            "❌ Nessuna SOURCE_URL configurata su Railway."
+        )
+        return
 
+    await update.message.reply_text("🧪 Controllo fonti in corso…")
+
+    lines: List[str] = []
+    for source_url in SOURCE_URLS:
+        _, diagnostics = await extract_items(source_url)
+        if diagnostics["error"]:
+            lines.append(
+                f"❌ {source_url}\nErrore: {diagnostics['error'][:180]}"
+            )
+        else:
+            lines.append(
+                f"✅ {source_url}\n"
+                f"HTTP {diagnostics['status']} | "
+                f"link {diagnostics['links']} | "
+                f"annunci {diagnostics['extracted']} | "
+                f"con prezzo {diagnostics['priced']}"
+            )
+
+    message = "\n\n".join(lines)
+    await update.message.reply_text(message[:4000])
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    save_json(STATE_FILE, {"observed": [], "notified": []})
     await update.message.reply_text(
-        "♻️ Memoria degli annunci azzerata.\n"
-        "Ora invia /scan per ripetere il test."
+        "♻️ Memoria annunci azzerata.\n"
+        "Lo storico prezzi è stato mantenuto."
     )
 
 
-async def stop(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None or update.message is None:
         return
 
     remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text(
-        "🔕 Avvisi disattivati."
-    )
+    await update.message.reply_text("🔕 Avvisi disattivati.")
 
 
 # ============================================================
@@ -1004,11 +979,8 @@ async def scan_loop(application: Application) -> None:
     while True:
         try:
             await scan_once(application)
-
         except Exception:
-            log.exception(
-                "Errore durante la scansione automatica"
-            )
+            log.exception("Errore durante la scansione automatica")
 
         await asyncio.sleep(CHECK_MINUTES * 60)
 
@@ -1035,27 +1007,21 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("test", test))
     application.add_handler(CommandHandler("scan", scan))
+    application.add_handler(CommandHandler("fonti", fonti))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        (
-            "Avvio Radar Affari AI: %s fonti, %s parole chiave, "
-            "margine minimo %.0f €, ROI minimo %.0f%%."
-        ),
+        "Avvio Radar Affari: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
-        MIN_MARGIN_EURO,
-        MIN_ROI_PERCENT,
+        DATA_DIR,
     )
 
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-
 
 
