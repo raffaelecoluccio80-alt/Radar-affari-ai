@@ -602,6 +602,64 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
         return [], diagnostics
 
 
+
+async def extract_debug_samples(
+    url: str,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Restituisce alcuni annunci riconosciuti prima del filtro KEYWORDS.
+    Serve esclusivamente per diagnosticare titolo, testo, prezzo e URL.
+    """
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=30,
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+
+    final_url = str(response.url)
+    soup = BeautifulSoup(response.text, "html.parser")
+    items: Dict[str, Dict[str, Any]] = {}
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            raw = script.string or script.get_text()
+            if raw:
+                extract_from_json_data(
+                    json.loads(raw),
+                    final_url,
+                    items,
+                )
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data is not None:
+        try:
+            raw = next_data.string or next_data.get_text()
+            if raw:
+                extract_from_json_data(
+                    json.loads(raw),
+                    final_url,
+                    items,
+                )
+        except json.JSONDecodeError:
+            pass
+
+    extract_from_html(soup, final_url, items)
+
+    samples = list(items.values())[:limit]
+
+    for sample in samples:
+        combined = normalize_text(
+            f"{sample.get('title', '')} {sample.get('text', '')}"
+        )
+        sample["debug_matches"] = matching_keywords(combined)
+
+    return samples
+
 # ============================================================
 # STORICO E ANALISI ECONOMICA
 # ============================================================
@@ -949,6 +1007,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status - stato del radar\n"
         "/fonti - diagnostica delle fonti\n"
         "/collector - stato archivio mercato\n"
+        "/debug - mostra cosa legge il parser\n"
         "/test - prova Telegram\n"
         "/scan - scansione manuale\n"
         "/reset - azzera memoria annunci\n"
@@ -1050,6 +1109,79 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = "\n\n".join(lines)
     await update.message.reply_text(message[:4000])
 
+
+
+async def debug(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    if not SOURCE_URLS:
+        await update.message.reply_text(
+            "❌ Nessuna SOURCE_URL configurata."
+        )
+        return
+
+    await update.message.reply_text(
+        "🧪 Lettura dei primi annunci in corso…"
+    )
+
+    messages: List[str] = []
+
+    for source_url in SOURCE_URLS[:3]:
+        try:
+            samples = await extract_debug_samples(
+                source_url,
+                limit=5,
+            )
+        except Exception as exc:
+            messages.append(
+                f"❌ Fonte: {source_url}\nErrore: {str(exc)[:250]}"
+            )
+            continue
+
+        if not samples:
+            messages.append(
+                f"⚠️ Fonte: {source_url}\n"
+                "Nessun annuncio riconosciuto."
+            )
+            continue
+
+        lines = [f"📡 Fonte: {source_url}"]
+
+        for index, item in enumerate(samples, start=1):
+            title = normalize_text(
+                str(item.get("title") or "")
+            )[:220]
+            text = normalize_text(
+                str(item.get("text") or "")
+            )[:300]
+            price = item.get("price")
+            matched = ", ".join(
+                item.get("debug_matches", [])
+            ) or "nessuna"
+            url = str(item.get("url") or "")
+
+            lines.append(
+                f"\n#{index}\n"
+                f"Titolo: {title or '[vuoto]'}\n"
+                f"Prezzo: {price if price is not None else '[mancante]'}\n"
+                f"Keyword: {matched}\n"
+                f"Testo: {text or '[vuoto]'}\n"
+                f"URL: {url}"
+            )
+
+        messages.append("\n".join(lines))
+
+    for message in messages:
+        # Telegram limita i messaggi a 4096 caratteri.
+        for start_index in range(0, len(message), 3900):
+            await update.message.reply_text(
+                message[start_index:start_index + 3900],
+                disable_web_page_preview=True,
+            )
 
 async def collector(
     update: Update,
@@ -1153,6 +1285,7 @@ def main() -> None:
     application.add_handler(CommandHandler("scan", scan))
     application.add_handler(CommandHandler("fonti", fonti))
     application.add_handler(CommandHandler("collector", collector))
+    application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
@@ -1168,6 +1301,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
