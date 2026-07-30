@@ -50,11 +50,46 @@ KEYWORDS = [
     if value.strip()
 ]
 
-SOURCE_URLS = [
+# Fonti mirate: evitiamo la pagina generica "vendita" e leggiamo
+# direttamente le categorie dove è più probabile trovare prodotti utili.
+DEFAULT_SOURCE_URLS = [
+    "https://www.subito.it/annunci-piemonte/vendita/biciclette/",
+    "https://www.subito.it/annunci-piemonte/vendita/telefonia/",
+    "https://www.subito.it/annunci-piemonte/vendita/informatica/",
+    "https://www.subito.it/annunci-piemonte/vendita/elettrodomestici/",
+    "https://www.subito.it/annunci-piemonte/vendita/fotografia/",
+]
+
+configured_sources = [
     value.strip()
     for value in os.getenv("SOURCE_URLS", "").split(",")
     if value.strip()
 ]
+
+# Se su Railway esiste ancora soltanto la vecchia pagina generica,
+# usiamo automaticamente le categorie mirate.
+GENERIC_SOURCE_URLS = {
+    "https://www.subito.it/annunci-piemonte/vendita",
+    "https://www.subito.it/annunci-piemonte/vendita/",
+}
+
+normalized_configured_sources = {
+    value.rstrip("/")
+    for value in configured_sources
+}
+
+if (
+    not configured_sources
+    or normalized_configured_sources
+    == {value.rstrip("/") for value in GENERIC_SOURCE_URLS}
+):
+    SOURCE_URLS = DEFAULT_SOURCE_URLS
+else:
+    # Mantiene eventuali fonti personalizzate e aggiunge quelle principali,
+    # evitando duplicati.
+    SOURCE_URLS = list(dict.fromkeys(
+        configured_sources + DEFAULT_SOURCE_URLS
+    ))
 
 configured_data_dir = os.getenv("DATA_DIR", "").strip()
 if configured_data_dir:
@@ -86,6 +121,21 @@ HEADERS = {
 }
 
 SCAN_LOCK = asyncio.Lock()
+
+
+
+def source_label(url: str) -> str:
+    path = urlparse(url).path.lower()
+    for category in (
+        "biciclette",
+        "telefonia",
+        "informatica",
+        "elettrodomestici",
+        "fotografia",
+    ):
+        if f"/{category}/" in path:
+            return category.capitalize()
+    return urlparse(url).netloc or "Fonte"
 
 
 # ============================================================
@@ -1001,11 +1051,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari attivato.\n\n"
+        "✅ Radar Affari Categorie attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n\n"
         "/status - stato del radar\n"
         "/fonti - diagnostica delle fonti\n"
+        "/categorie - mostra le categorie attive\n"
         "/collector - stato archivio mercato\n"
         "/debug - mostra cosa legge il parser\n"
         "/test - prova Telegram\n"
@@ -1098,7 +1149,8 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         else:
             lines.append(
-                f"✅ {source_url}\n"
+                f"✅ {source_label(source_url)}\n"
+                f"{source_url}\n"
                 f"HTTP {diagnostics['status']}\n"
                 f"Link totali: {diagnostics['links']}\n"
                 f"URL annunci riconosciuti: {diagnostics['listing_urls']}\n"
@@ -1108,6 +1160,31 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     message = "\n\n".join(lines)
     await update.message.reply_text(message[:4000])
+
+
+
+
+async def categorie(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    lines = [
+        "🧭 CATEGORIE ATTIVE",
+        "",
+    ]
+
+    for index, source_url in enumerate(SOURCE_URLS, start=1):
+        lines.append(
+            f"{index}. {source_label(source_url)}\n{source_url}"
+        )
+
+    await update.message.reply_text(
+        "\n\n".join(lines)[:4000],
+        disable_web_page_preview=True,
+    )
 
 
 
@@ -1284,6 +1361,7 @@ def main() -> None:
     application.add_handler(CommandHandler("test", test))
     application.add_handler(CommandHandler("scan", scan))
     application.add_handler(CommandHandler("fonti", fonti))
+    application.add_handler(CommandHandler("categorie", categorie))
     application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("reset", reset))
