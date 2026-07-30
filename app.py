@@ -69,6 +69,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "radar_state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
 HISTORY_FILE = DATA_DIR / "radar_history.json"
+STATS_FILE = DATA_DIR / "radar_stats.json"
 
 HEADERS = {
     "User-Agent": (
@@ -397,7 +398,7 @@ def add_item(
     combined_text = normalize_text(f"{title} {full_text}")
     matched = matching_keywords(combined_text)
 
-    if len(title) < 4 or not matched:
+    if len(title) < 4:
         return
 
     product = identify_product(combined_text)
@@ -538,6 +539,7 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
         "url": url,
         "status": None,
         "links": 0,
+        "listing_urls": 0,
         "extracted": 0,
         "priced": 0,
         "error": "",
@@ -579,11 +581,20 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
 
         extract_from_html(soup, final_url, items)
 
-        result = list(items.values())
-        diagnostics["extracted"] = len(result)
-        diagnostics["priced"] = sum(1 for item in result if item.get("price") is not None)
+        all_listings = list(items.values())
+        relevant_items = [
+            item for item in all_listings
+            if item.get("matched")
+        ]
 
-        return result, diagnostics
+        diagnostics["listing_urls"] = len(all_listings)
+        diagnostics["extracted"] = len(relevant_items)
+        diagnostics["priced"] = sum(
+            1 for item in relevant_items
+            if item.get("price") is not None
+        )
+
+        return relevant_items, diagnostics
 
     except Exception as exc:
         diagnostics["error"] = str(exc)
@@ -596,30 +607,102 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
 # ============================================================
 
 def update_history(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Modalità COLLECTOR:
+    - salva ogni annuncio pertinente con prezzo;
+    - aggiorna gli annunci già conosciuti;
+    - conserva prima e ultima rilevazione;
+    - registra eventuali variazioni di prezzo.
+    """
     history = load_json(HISTORY_FILE, [])
-    existing_ids = {row.get("id") for row in history if isinstance(row, dict)}
     now = datetime.now(timezone.utc).isoformat()
 
+    rows_by_id: Dict[str, Dict[str, Any]] = {
+        str(row.get("id")): row
+        for row in history
+        if isinstance(row, dict) and row.get("id")
+    }
+
     for item in items:
-        if item.get("id") in existing_ids:
-            continue
-        if not isinstance(item.get("price"), (int, float)):
+        item_id = str(item.get("id") or "")
+        price = item.get("price")
+
+        if not item_id or not isinstance(price, (int, float)):
             continue
 
-        history.append({
-            "id": item["id"],
-            "product_key": item.get("product_key") or "",
-            "brand": item.get("brand") or "",
-            "model": item.get("model") or "",
-            "price": float(item["price"]),
-            "title": item.get("title", ""),
-            "url": item.get("url", ""),
-            "seen_at": now,
-        })
+        current_price = float(price)
+        existing = rows_by_id.get(item_id)
 
-    history = history[-20000:]
+        if existing is None:
+            row = {
+                "id": item_id,
+                "product_key": item.get("product_key") or "",
+                "brand": item.get("brand") or "",
+                "model": item.get("model") or "",
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "source_url": item.get("source_url", ""),
+                "first_seen": now,
+                "last_seen": now,
+                "observations": 1,
+                "price": current_price,
+                "price_history": [
+                    {"at": now, "price": current_price}
+                ],
+            }
+            history.append(row)
+            rows_by_id[item_id] = row
+            continue
+
+        existing["last_seen"] = now
+        existing["observations"] = int(existing.get("observations", 0)) + 1
+        existing["title"] = item.get("title", existing.get("title", ""))
+        existing["url"] = item.get("url", existing.get("url", ""))
+        existing["product_key"] = (
+            item.get("product_key")
+            or existing.get("product_key", "")
+        )
+        existing["brand"] = item.get("brand") or existing.get("brand", "")
+        existing["model"] = item.get("model") or existing.get("model", "")
+
+        old_price = existing.get("price")
+        if not isinstance(old_price, (int, float)) or float(old_price) != current_price:
+            price_history = existing.setdefault("price_history", [])
+            price_history.append({"at": now, "price": current_price})
+            existing["price"] = current_price
+
+    history = history[-30000:]
     save_json(HISTORY_FILE, history)
     return history
+
+
+def update_collection_stats(
+    diagnostics: List[Dict[str, Any]],
+    relevant_items: List[Dict[str, Any]],
+    new_items_count: int,
+) -> Dict[str, Any]:
+    stats = load_json(
+        STATS_FILE,
+        {
+            "scans": 0,
+            "total_relevant_seen": 0,
+            "total_new_seen": 0,
+            "last_scan": None,
+        },
+    )
+
+    stats["scans"] = int(stats.get("scans", 0)) + 1
+    stats["total_relevant_seen"] = int(
+        stats.get("total_relevant_seen", 0)
+    ) + len(relevant_items)
+    stats["total_new_seen"] = int(
+        stats.get("total_new_seen", 0)
+    ) + new_items_count
+    stats["last_scan"] = datetime.now(timezone.utc).isoformat()
+    stats["last_sources"] = diagnostics
+
+    save_json(STATS_FILE, stats)
+    return stats
 
 
 def estimate_market_values(
@@ -786,6 +869,11 @@ async def scan_once(application: Application) -> Dict[str, Any]:
                     new_items.append(item)
 
         history = update_history(all_extracted)
+        update_collection_stats(
+            diagnostics=diagnostics,
+            relevant_items=all_extracted,
+            new_items_count=len(new_items),
+        )
         estimate_market_values(new_items, history)
 
         valid_deals = [
@@ -860,6 +948,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n\n"
         "/status - stato del radar\n"
         "/fonti - diagnostica delle fonti\n"
+        "/collector - stato archivio mercato\n"
         "/test - prova Telegram\n"
         "/scan - scansione manuale\n"
         "/reset - azzera memoria annunci\n"
@@ -873,6 +962,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     history = load_json(HISTORY_FILE, [])
     state = load_json(STATE_FILE, {"observed": [], "notified": []})
+    stats = load_json(STATS_FILE, {"scans": 0})
+
+    identified_models = {
+        str(row.get("product_key"))
+        for row in history
+        if isinstance(row, dict)
+        and row.get("product_key")
+        and ":" in str(row.get("product_key"))
+    }
 
     await update.message.reply_text(
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
@@ -880,7 +978,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
         f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
-        f"📚 Prezzi nello storico: {len(history)}\n"
+        f"📚 Annunci nel Collector: {len(history)}\n"
+        f"🧩 Modelli identificati: {len(identified_models)}\n"
+        f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
         f"👁 Annunci osservati: {len(state.get('observed', []))}\n"
         f"🔔 Annunci notificati: {len(state.get('notified', []))}\n"
         f"👥 Iscritti: {len(subscribers())}\n"
@@ -940,14 +1040,58 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             lines.append(
                 f"✅ {source_url}\n"
-                f"HTTP {diagnostics['status']} | "
-                f"link {diagnostics['links']} | "
-                f"annunci {diagnostics['extracted']} | "
-                f"con prezzo {diagnostics['priced']}"
+                f"HTTP {diagnostics['status']}\n"
+                f"Link totali: {diagnostics['links']}\n"
+                f"URL annunci riconosciuti: {diagnostics['listing_urls']}\n"
+                f"Annunci pertinenti: {diagnostics['extracted']}\n"
+                f"Pertinenti con prezzo: {diagnostics['priced']}"
             )
 
     message = "\n\n".join(lines)
     await update.message.reply_text(message[:4000])
+
+
+async def collector(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    history = load_json(HISTORY_FILE, [])
+    stats = load_json(STATS_FILE, {"scans": 0})
+
+    by_product: Dict[str, int] = {}
+    price_changes = 0
+
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+
+        key = str(row.get("product_key") or "non identificato")
+        by_product[key] = by_product.get(key, 0) + 1
+
+        if len(row.get("price_history", [])) > 1:
+            price_changes += 1
+
+    top_products = sorted(
+        by_product.items(),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )[:8]
+
+    top_text = "\n".join(
+        f"• {name}: {count}"
+        for name, count in top_products
+    ) or "• nessun dato"
+
+    await update.message.reply_text(
+        "🗄 STATO COLLECTOR\n\n"
+        f"Annunci archiviati: {len(history)}\n"
+        f"Scansioni registrate: {int(stats.get('scans', 0))}\n"
+        f"Annunci con variazioni prezzo: {price_changes}\n\n"
+        f"Prodotti più raccolti:\n{top_text}"
+    )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1008,11 +1152,12 @@ def main() -> None:
     application.add_handler(CommandHandler("test", test))
     application.add_handler(CommandHandler("scan", scan))
     application.add_handler(CommandHandler("fonti", fonti))
+    application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Collector: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
