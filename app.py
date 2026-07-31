@@ -1,6 +1,3 @@
-app_radar_v1_4.py
-
-
 import asyncio
 import hashlib
 import html
