@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -34,6 +34,18 @@ CHECK_MINUTES = max(int(os.getenv("CHECK_MINUTES", "15")), 5)
 MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
 MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
 MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
+
+# Parametri del motore di valutazione v1.2.
+# Il Radar usa solo confronti recenti, elimina prezzi anomali e assegna
+# un livello di attendibilità alla stima.
+MARKET_LOOKBACK_DAYS = max(int(os.getenv("MARKET_LOOKBACK_DAYS", "90")), 7)
+MIN_COMPARABLES = max(int(os.getenv("MIN_COMPARABLES", "5")), 3)
+GOOD_COMPARABLES = max(int(os.getenv("GOOD_COMPARABLES", "12")), MIN_COMPARABLES)
+HIGH_COMPARABLES = max(int(os.getenv("HIGH_COMPARABLES", "25")), GOOD_COMPARABLES)
+MIN_CONFIDENCE_SCORE = min(
+    max(int(os.getenv("MIN_CONFIDENCE_SCORE", "45")), 0),
+    100,
+)
 
 KEYWORDS = [
     value.strip().lower()
@@ -853,44 +865,274 @@ def update_collection_stats(
     return stats
 
 
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def percentile(values: List[float], fraction: float) -> float:
+    """Percentile lineare senza dipendenze esterne."""
+    if not values:
+        raise ValueError("Lista vuota")
+
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+
+    position = (len(ordered) - 1) * min(max(fraction, 0.0), 1.0)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    weight = position - lower_index
+
+    return (
+        ordered[lower_index] * (1 - weight)
+        + ordered[upper_index] * weight
+    )
+
+
+def remove_price_outliers(prices: List[float]) -> List[float]:
+    """
+    Elimina prezzi anomali usando l'intervallo interquartile.
+
+    Con pochi dati mantiene tutti i prezzi: è preferibile dichiarare una
+    bassa attendibilità piuttosto che eliminare confronti arbitrariamente.
+    """
+    clean = sorted(
+        float(price)
+        for price in prices
+        if isinstance(price, (int, float)) and float(price) > 0
+    )
+
+    if len(clean) < 5:
+        return clean
+
+    q1 = percentile(clean, 0.25)
+    q3 = percentile(clean, 0.75)
+    iqr = q3 - q1
+
+    if iqr <= 0:
+        return clean
+
+    lower_limit = max(5.0, q1 - 1.5 * iqr)
+    upper_limit = q3 + 1.5 * iqr
+
+    filtered = [
+        price for price in clean
+        if lower_limit <= price <= upper_limit
+    ]
+
+    # Non consentiamo al filtro di cancellare quasi tutto il campione.
+    return filtered if len(filtered) >= 3 else clean
+
+
+def market_confidence(
+    prices: List[float],
+    newest_seen: Optional[datetime],
+) -> Tuple[int, str]:
+    """
+    Calcola un punteggio 0-100 basato su:
+    - quantità di confronti;
+    - dispersione dei prezzi;
+    - freschezza del campione.
+    """
+    count = len(prices)
+    if count == 0:
+        return 0, "INSUFFICIENTE"
+
+    if count >= HIGH_COMPARABLES:
+        count_score = 60
+    elif count >= GOOD_COMPARABLES:
+        count_score = 48
+    elif count >= MIN_COMPARABLES:
+        count_score = 34
+    else:
+        count_score = min(25, count * 5)
+
+    med = float(median(prices))
+    q1 = percentile(prices, 0.25)
+    q3 = percentile(prices, 0.75)
+    relative_spread = (q3 - q1) / med if med > 0 else 1.0
+
+    if relative_spread <= 0.15:
+        spread_score = 30
+    elif relative_spread <= 0.25:
+        spread_score = 24
+    elif relative_spread <= 0.40:
+        spread_score = 16
+    else:
+        spread_score = 6
+
+    freshness_score = 0
+    if newest_seen is not None:
+        age_days = max(
+            0,
+            (datetime.now(timezone.utc) - newest_seen).days,
+        )
+        if age_days <= 7:
+            freshness_score = 10
+        elif age_days <= 30:
+            freshness_score = 7
+        elif age_days <= MARKET_LOOKBACK_DAYS:
+            freshness_score = 4
+
+    score = min(100, count_score + spread_score + freshness_score)
+
+    if score >= 80:
+        label = "MOLTO ALTA"
+    elif score >= 65:
+        label = "ALTA"
+    elif score >= 50:
+        label = "DISCRETA"
+    elif score >= MIN_CONFIDENCE_SCORE:
+        label = "PRUDENTE"
+    else:
+        label = "BASSA"
+
+    return score, label
+
+
 def estimate_market_values(
     items: List[Dict[str, Any]],
     history: List[Dict[str, Any]],
 ) -> None:
-    historical_prices: Dict[str, List[float]] = {}
+    """
+    Motore di valutazione v1.2.
+
+    Per ogni prodotto:
+    - considera un solo prezzo per annuncio;
+    - usa soltanto dati entro MARKET_LOOKBACK_DAYS;
+    - esclude l'annuncio che sta valutando;
+    - rimuove gli outlier;
+    - stima valore centrale e fascia prudenziale;
+    - assegna un punteggio di attendibilità.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=MARKET_LOOKBACK_DAYS
+    )
+
+    rows_by_product: Dict[str, List[Dict[str, Any]]] = {}
 
     for row in history:
+        if not isinstance(row, dict):
+            continue
+
         key = str(row.get("product_key") or "").strip().lower()
         price = row.get("price")
-        if key and isinstance(price, (int, float)):
-            historical_prices.setdefault(key, []).append(float(price))
+        last_seen = parse_iso_datetime(
+            row.get("last_seen") or row.get("first_seen")
+        )
+
+        if (
+            not key
+            or not isinstance(price, (int, float))
+            or float(price) <= 0
+            or last_seen is None
+            or last_seen < cutoff
+        ):
+            continue
+
+        rows_by_product.setdefault(key, []).append({
+            "id": str(row.get("id") or ""),
+            "price": float(price),
+            "last_seen": last_seen,
+        })
 
     for item in items:
-        price = item.get("price")
+        asking_price = item.get("price")
         key = str(item.get("product_key") or "").strip().lower()
-        comparable_prices = historical_prices.get(key, [])
+        item_id = str(item.get("id") or "")
 
-        if price is None or not key or len(comparable_prices) < 3:
+        raw_rows = [
+            row for row in rows_by_product.get(key, [])
+            if row["id"] != item_id
+        ]
+        raw_prices = [row["price"] for row in raw_rows]
+        comparable_prices = remove_price_outliers(raw_prices)
+
+        newest_seen = max(
+            (row["last_seen"] for row in raw_rows),
+            default=None,
+        )
+        confidence_score, confidence_label = market_confidence(
+            comparable_prices,
+            newest_seen,
+        )
+
+        item["raw_comparables"] = len(raw_prices)
+        item["comparables"] = len(comparable_prices)
+        item["outliers_removed"] = max(
+            0,
+            len(raw_prices) - len(comparable_prices),
+        )
+        item["confidence_score"] = confidence_score
+        item["confidence_label"] = confidence_label
+        item["market_lookback_days"] = MARKET_LOOKBACK_DAYS
+
+        if comparable_prices:
+            item["market_low"] = round(
+                percentile(comparable_prices, 0.25),
+                2,
+            )
+            item["market_high"] = round(
+                percentile(comparable_prices, 0.75),
+                2,
+            )
+        else:
+            item["market_low"] = None
+            item["market_high"] = None
+
+        if (
+            asking_price is None
+            or not key
+            or len(comparable_prices) < MIN_COMPARABLES
+            or confidence_score < MIN_CONFIDENCE_SCORE
+        ):
             item["market_value"] = None
             item["quick_sale_value"] = None
             item["estimated_costs"] = None
             item["estimated_margin"] = None
             item["roi"] = None
-            item["comparables"] = len(comparable_prices)
             continue
 
         market_value = float(median(comparable_prices))
-        quick_sale_value = market_value * 0.90
-        estimated_costs = max(20.0, float(price) * 0.05)
-        estimated_margin = quick_sale_value - float(price) - estimated_costs
-        roi = estimated_margin / float(price) * 100 if float(price) > 0 else 0
+
+        # Vendita rapida prudenziale: usiamo il valore più basso tra
+        # il 25° percentile e il 90% della mediana.
+        quick_sale_value = min(
+            percentile(comparable_prices, 0.25),
+            market_value * 0.90,
+        )
+
+        estimated_costs = max(
+            25.0,
+            float(asking_price) * 0.06,
+        )
+        estimated_margin = (
+            quick_sale_value
+            - float(asking_price)
+            - estimated_costs
+        )
+        roi = (
+            estimated_margin / float(asking_price) * 100
+            if float(asking_price) > 0
+            else 0
+        )
 
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
         item["estimated_costs"] = round(estimated_costs, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
-        item["comparables"] = len(comparable_prices)
 
 
 def is_valid_deal(item: Dict[str, Any]) -> bool:
@@ -898,7 +1140,13 @@ def is_valid_deal(item: Dict[str, Any]) -> bool:
     margin = item.get("estimated_margin")
     roi = item.get("roi")
 
-    if margin is None or roi is None:
+    confidence_score = int(item.get("confidence_score") or 0)
+
+    if (
+        margin is None
+        or roi is None
+        or confidence_score < MIN_CONFIDENCE_SCORE
+    ):
         return False
 
     return (
@@ -924,8 +1172,12 @@ def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
     margin = item.get("estimated_margin")
     roi = item.get("roi")
 
+    confidence_score = int(item.get("confidence_score") or 0)
+
     if risk["level"] == "ALTO":
         return "SCARTA: RISCHIO ALTO"
+    if confidence_score < MIN_CONFIDENCE_SCORE:
+        return "SCARTA: STIMA NON ANCORA ATTENDIBILE"
     if margin is None or roi is None:
         return "SCARTA: DATI ECONOMICI INSUFFICIENTI"
     if float(margin) < MIN_MARGIN_EURO:
@@ -965,7 +1217,13 @@ def build_message(item: Dict[str, Any]) -> str:
         f"🧾 Costi prudenziali: <b>{euro(item.get('estimated_costs'))}</b>\n"
         f"💵 Margine stimato: <b>{euro(item.get('estimated_margin'))}</b>\n"
         f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
-        f"📚 Confronti disponibili: <b>{item.get('comparables', 0)}</b>\n"
+        f"📉 Fascia mercato centrale: <b>{euro(item.get('market_low'))} – {euro(item.get('market_high'))}</b>\n"
+        f"📚 Confronti utilizzati: <b>{item.get('comparables', 0)}</b> "
+        f"su {item.get('raw_comparables', 0)}\n"
+        f"🧹 Prezzi anomali esclusi: <b>{item.get('outliers_removed', 0)}</b>\n"
+        f"🛡 Attendibilità: <b>{item.get('confidence_label', 'INSUFFICIENTE')}</b> "
+        f"({item.get('confidence_score', 0)}/100)\n"
+        f"🗓 Finestra dati: <b>{item.get('market_lookback_days', MARKET_LOOKBACK_DAYS)} giorni</b>\n"
         f"🎯 Indice opportunità: <b>{opportunity_score(item)}</b>\n\n"
         f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n"
         f"Motivi: {html.escape(reasons)}\n\n"
@@ -1093,7 +1351,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "✅ Radar Affari Categorie attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
-        f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n\n"
+        f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
+        f"• Confronti minimi: {MIN_COMPARABLES}\n"
+        f"• Storico usato: {MARKET_LOOKBACK_DAYS} giorni\n\n"
         "/status - stato del radar\n"
         "/fonti - diagnostica delle fonti\n"
         "/categorie - mostra le categorie attive\n"
@@ -1128,6 +1388,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
         f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
+        f"🛡 Attendibilità minima: {MIN_CONFIDENCE_SCORE}/100\n"
+        f"📅 Storico utilizzato: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
+        f"📚 Confronti minimi per stima: {MIN_COMPARABLES}\n"
         f"📚 Annunci nel Collector: {len(history)}\n"
         f"🧩 Modelli identificati: {len(identified_models)}\n"
         f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
