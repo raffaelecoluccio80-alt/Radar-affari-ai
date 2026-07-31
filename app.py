@@ -270,7 +270,57 @@ def matching_keywords(text: str) -> List[str]:
 
 
 def identify_product(text: str) -> Dict[str, str]:
+    """Riconosce marca, modello e variante principale del prodotto.
+
+    Per gli iPhone include la memoria nel product_key, così modelli e tagli
+    differenti non vengono più mescolati nello stesso gruppo di confronto.
+    """
     lowered = normalize_text(text).lower()
+
+    iphone_rules: List[Tuple[str, str]] = [
+        (r"\biphone\s*15\s*pro\s*max\b", "iPhone 15 Pro Max"),
+        (r"\biphone\s*15\s*pro\b", "iPhone 15 Pro"),
+        (r"\biphone\s*15\s*plus\b", "iPhone 15 Plus"),
+        (r"\biphone\s*15\b", "iPhone 15"),
+        (r"\biphone\s*14\s*pro\s*max\b", "iPhone 14 Pro Max"),
+        (r"\biphone\s*14\s*pro\b", "iPhone 14 Pro"),
+        (r"\biphone\s*14\s*plus\b", "iPhone 14 Plus"),
+        (r"\biphone\s*14\b", "iPhone 14"),
+        (r"\biphone\s*13\s*pro\s*max\b", "iPhone 13 Pro Max"),
+        (r"\biphone\s*13\s*pro\b", "iPhone 13 Pro"),
+        (r"\biphone\s*13\s*mini\b", "iPhone 13 Mini"),
+        (r"\biphone\s*13\b", "iPhone 13"),
+        (r"\biphone\s*12\s*pro\s*max\b", "iPhone 12 Pro Max"),
+        (r"\biphone\s*12\s*pro\b", "iPhone 12 Pro"),
+        (r"\biphone\s*12\s*mini\b", "iPhone 12 Mini"),
+        (r"\biphone\s*12\b", "iPhone 12"),
+        (r"\biphone\s*11\s*pro\s*max\b", "iPhone 11 Pro Max"),
+        (r"\biphone\s*11\s*pro\b", "iPhone 11 Pro"),
+        (r"\biphone\s*11\b", "iPhone 11"),
+        (r"\biphone\s*xs\s*max\b", "iPhone XS Max"),
+        (r"\biphone\s*xs\b", "iPhone XS"),
+        (r"\biphone\s*xr\b", "iPhone XR"),
+        (r"\biphone\s*x\b", "iPhone X"),
+        (r"\biphone\s*se(?:\s*2022|\s*3(?:a|ª)?\s*gen(?:erazione)?)\b", "iPhone SE 2022"),
+        (r"\biphone\s*se(?:\s*2020|\s*2(?:a|ª)?\s*gen(?:erazione)?)\b", "iPhone SE 2020"),
+        (r"\biphone\s*8\s*plus\b", "iPhone 8 Plus"),
+        (r"\biphone\s*8\b", "iPhone 8"),
+    ]
+
+    for pattern, model in iphone_rules:
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            storage_match = re.search(
+                r"(?<!\d)(64|128|256|512|1024)\s*(?:gb|giga)\b",
+                lowered,
+                flags=re.IGNORECASE,
+            )
+            storage = f"{storage_match.group(1)}GB" if storage_match else ""
+            variant = f" {storage}" if storage else ""
+            return {
+                "brand": "apple",
+                "model": f"{model}{variant}",
+                "product_key": f"apple:{model}:{storage or 'memoria-non-specificata'}".lower(),
+            }
 
     rules: List[Tuple[str, str, str]] = [
         ("engwe", r"\bep[-\s]?2\s*pro\b", "EP-2 Pro"),
@@ -282,16 +332,6 @@ def identify_product(text: str) -> Dict[str, str]:
         ("dyson", r"\bv11\b", "V11"),
         ("dyson", r"\bv10\b", "V10"),
         ("dyson", r"\bv8\b", "V8"),
-        ("apple", r"\biphone\s*15\s*pro\s*max\b", "iPhone 15 Pro Max"),
-        ("apple", r"\biphone\s*15\s*pro\b", "iPhone 15 Pro"),
-        ("apple", r"\biphone\s*14\s*pro\s*max\b", "iPhone 14 Pro Max"),
-        ("apple", r"\biphone\s*14\s*pro\b", "iPhone 14 Pro"),
-        ("apple", r"\biphone\s*13\s*pro\s*max\b", "iPhone 13 Pro Max"),
-        ("apple", r"\biphone\s*13\s*pro\b", "iPhone 13 Pro"),
-        ("apple", r"\biphone\s*13\b", "iPhone 13"),
-        ("apple", r"\biphone\s*12\s*pro\s*max\b", "iPhone 12 Pro Max"),
-        ("apple", r"\biphone\s*12\s*pro\b", "iPhone 12 Pro"),
-        ("apple", r"\biphone\s*12\b", "iPhone 12"),
         ("sony", r"\bps5\b|\bplaystation\s*5\b", "PlayStation 5"),
         ("nintendo", r"\bswitch\s*oled\b", "Switch OLED"),
     ]
@@ -1379,5 +1419,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
