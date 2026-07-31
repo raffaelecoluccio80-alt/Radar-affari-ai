@@ -35,7 +35,7 @@ MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
 MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
 MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
 
-# Parametri del motore di valutazione v1.2.
+# Parametri del motore di valutazione v1.3.
 # Il Radar usa solo confronti recenti, elimina prezzi anomali e assegna
 # un livello di attendibilità alla stima.
 MARKET_LOOKBACK_DAYS = max(int(os.getenv("MARKET_LOOKBACK_DAYS", "90")), 7)
@@ -1006,7 +1006,7 @@ def estimate_market_values(
     history: List[Dict[str, Any]],
 ) -> None:
     """
-    Motore di valutazione v1.2.
+    Motore di valutazione v1.3.
 
     Per ogni prodotto:
     - considera un solo prezzo per annuncio;
@@ -1135,58 +1135,117 @@ def estimate_market_values(
         item["roi"] = round(roi, 1)
 
 
-def is_valid_deal(item: Dict[str, Any]) -> bool:
+def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Trasforma i dati economici in una decisione spiegabile."""
     risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
     margin = item.get("estimated_margin")
     roi = item.get("roi")
+    market_value = item.get("market_value")
+    quick_sale_value = item.get("quick_sale_value")
+    asking_price = item.get("price")
+    costs = item.get("estimated_costs")
+    confidence = int(item.get("confidence_score") or 0)
+    precise_model = bool(item.get("model")) and ":" in str(item.get("product_key") or "")
 
-    confidence_score = int(item.get("confidence_score") or 0)
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    if not precise_model:
+        warnings.append("modello o variante non identificati con precisione")
+    if confidence < MIN_CONFIDENCE_SCORE:
+        warnings.append("campione di mercato non ancora abbastanza attendibile")
+    if risk["reasons"]:
+        warnings.extend(f"rischio: {reason}" for reason in risk["reasons"][:3])
+
+    score = 0.0
+    discount_percent: Optional[float] = None
+    max_offer: Optional[float] = None
 
     if (
-        margin is None
-        or roi is None
-        or confidence_score < MIN_CONFIDENCE_SCORE
+        isinstance(asking_price, (int, float))
+        and isinstance(market_value, (int, float))
+        and market_value > 0
     ):
-        return False
+        discount_percent = (market_value - asking_price) / market_value * 100
+        score += max(0.0, min(discount_percent, 30.0))
+        if discount_percent >= 20:
+            reasons.append("prezzo almeno 20% sotto il valore mediano")
+        elif discount_percent >= 10:
+            reasons.append("prezzo sotto il valore mediano")
 
-    return (
-        float(margin) >= MIN_MARGIN_EURO
-        and float(roi) >= MIN_ROI_PERCENT
-        and risk["level"] != "ALTO"
-    )
+    if isinstance(roi, (int, float)):
+        score += max(0.0, min(float(roi), 25.0))
+        if roi >= MIN_ROI_PERCENT:
+            reasons.append(f"ROI stimato almeno {MIN_ROI_PERCENT:.0f}%")
+
+    if isinstance(margin, (int, float)):
+        score += max(0.0, min(float(margin) / 8.0, 20.0))
+        if margin >= MIN_MARGIN_EURO:
+            reasons.append(f"margine stimato almeno {MIN_MARGIN_EURO:.0f} €")
+
+    score += min(confidence / 100 * 15, 15)
+    if confidence >= 65:
+        reasons.append("stima di mercato con buona attendibilità")
+
+    if precise_model:
+        score += 10
+        reasons.append("modello identificato con precisione")
+
+    score -= {"BASSO": 0, "MEDIO": 15, "ALTO": 45}.get(risk["level"], 20)
+    radar_score = int(round(max(0.0, min(score, 100.0))))
+
+    if (
+        isinstance(quick_sale_value, (int, float))
+        and isinstance(costs, (int, float))
+    ):
+        max_offer = max(0.0, quick_sale_value - costs - MIN_MARGIN_EURO)
+
+    if risk["level"] == "ALTO":
+        decision = "SCARTA"
+        label = "SCARTA: RISCHIO ALTO"
+    elif margin is None or roi is None or confidence < MIN_CONFIDENCE_SCORE:
+        decision = "DATI_INSUFFICIENTI"
+        label = "DATI INSUFFICIENTI: NON COMPRARE ANCORA"
+    elif float(margin) >= MIN_MARGIN_EURO and float(roi) >= MIN_ROI_PERCENT:
+        if precise_model and risk["level"] == "BASSO":
+            decision = "COMPRA"
+            label = "COMPRA: CONTATTA E VERIFICA SUBITO"
+        else:
+            decision = "TRATTA"
+            label = "TRATTA E VERIFICA PRIMA DI COMPRARE"
+    elif float(margin) >= MIN_MARGIN_EURO * 0.5 or float(roi) >= MIN_ROI_PERCENT * 0.5:
+        decision = "MONITORA"
+        label = "MONITORA: INTERESSANTE SOLO A PREZZO PIÙ BASSO"
+    else:
+        decision = "SCARTA"
+        label = "SCARTA: MARGINE O ROI INSUFFICIENTI"
+
+    return {
+        "decision": decision,
+        "label": label,
+        "radar_score": radar_score,
+        "confidence": confidence,
+        "risk": risk,
+        "discount_percent": round(discount_percent, 1) if discount_percent is not None else None,
+        "max_offer": round(max_offer, 2) if max_offer is not None else None,
+        "reasons": reasons[:5],
+        "warnings": warnings[:5],
+    }
+
+
+def is_valid_deal(item: Dict[str, Any]) -> bool:
+    return analyze_deal(item)["decision"] in {"COMPRA", "TRATTA"}
 
 
 def opportunity_score(item: Dict[str, Any]) -> float:
+    analysis = analyze_deal(item)
     margin = max(float(item.get("estimated_margin") or 0), 0)
-    roi = max(float(item.get("roi") or 0), 0)
-    risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
-
-    risk_penalty = {"BASSO": 0, "MEDIO": 15, "ALTO": 100}.get(
-        risk["level"], 30
-    )
-
-    return round(margin + (roi * 2) - risk_penalty, 2)
+    return round(analysis["radar_score"] * 10 + margin, 2)
 
 
 def verdict_for(item: Dict[str, Any], risk: Dict[str, Any]) -> str:
-    margin = item.get("estimated_margin")
-    roi = item.get("roi")
-
-    confidence_score = int(item.get("confidence_score") or 0)
-
-    if risk["level"] == "ALTO":
-        return "SCARTA: RISCHIO ALTO"
-    if confidence_score < MIN_CONFIDENCE_SCORE:
-        return "SCARTA: STIMA NON ANCORA ATTENDIBILE"
-    if margin is None or roi is None:
-        return "SCARTA: DATI ECONOMICI INSUFFICIENTI"
-    if float(margin) < MIN_MARGIN_EURO:
-        return f"SCARTA: MARGINE INFERIORE A {MIN_MARGIN_EURO:.0f} €"
-    if float(roi) < MIN_ROI_PERCENT:
-        return f"SCARTA: ROI INFERIORE AL {MIN_ROI_PERCENT:.0f}%"
-    if risk["level"] == "MEDIO":
-        return "TRATTA: MARGINE VALIDO, SERVONO VERIFICHE"
-    return "CANDIDATO: CONTATTARE E VERIFICARE"
+    # Manteniamo la firma per compatibilità con il resto dell'applicazione.
+    return analyze_deal(item)["label"]
 
 
 def euro(value: Optional[float]) -> str:
@@ -1196,8 +1255,8 @@ def euro(value: Optional[float]) -> str:
 
 
 def build_message(item: Dict[str, Any]) -> str:
-    risk = risk_analysis(f"{item.get('title', '')} {item.get('text', '')}")
-    verdict = verdict_for(item, risk)
+    analysis = analyze_deal(item)
+    risk = analysis["risk"]
 
     title = html.escape(str(item.get("title", "")))
     url = html.escape(str(item.get("url", "")), quote=True)
@@ -1205,31 +1264,38 @@ def build_message(item: Dict[str, Any]) -> str:
         part for part in [item.get("brand", ""), item.get("model", "")] if part
     ) or "non identificato"
 
-    reasons = ", ".join(risk["reasons"]) if risk["reasons"] else "nessun segnale evidente"
+    reasons = "\n".join(
+        f"✅ {html.escape(reason)}" for reason in analysis["reasons"]
+    ) or "• nessun elemento positivo sufficiente"
+    warnings = "\n".join(
+        f"⚠️ {html.escape(warning)}" for warning in analysis["warnings"]
+    ) or "• nessuna anomalia testuale evidente"
+
+    discount = analysis["discount_percent"]
+    discount_text = f"{discount:.1f}%" if discount is not None else "non disponibile"
 
     return (
-        "🚨 <b>AFFARE CANDIDATO</b>\n\n"
+        f"🎯 <b>RADAR SCORE {analysis['radar_score']}/100</b>\n"
+        f"🚦 <b>{html.escape(analysis['label'])}</b>\n\n"
         f"<b>{title}</b>\n"
         f"🧩 Prodotto: <b>{html.escape(product_name)}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
-        f"📊 Valore medio stimato: <b>{euro(item.get('market_value'))}</b>\n"
-        f"⚡ Rivendita rapida stimata: <b>{euro(item.get('quick_sale_value'))}</b>\n"
+        f"📊 Valore mediano stimato: <b>{euro(item.get('market_value'))}</b>\n"
+        f"⚡ Rivendita rapida prudente: <b>{euro(item.get('quick_sale_value'))}</b>\n"
+        f"🏷 Sconto sul mercato: <b>{discount_text}</b>\n"
+        f"🤝 Offerta massima prudente: <b>{euro(analysis.get('max_offer'))}</b>\n"
         f"🧾 Costi prudenziali: <b>{euro(item.get('estimated_costs'))}</b>\n"
         f"💵 Margine stimato: <b>{euro(item.get('estimated_margin'))}</b>\n"
         f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
-        f"📉 Fascia mercato centrale: <b>{euro(item.get('market_low'))} – {euro(item.get('market_high'))}</b>\n"
-        f"📚 Confronti utilizzati: <b>{item.get('comparables', 0)}</b> "
-        f"su {item.get('raw_comparables', 0)}\n"
-        f"🧹 Prezzi anomali esclusi: <b>{item.get('outliers_removed', 0)}</b>\n"
         f"🛡 Attendibilità: <b>{item.get('confidence_label', 'INSUFFICIENTE')}</b> "
         f"({item.get('confidence_score', 0)}/100)\n"
-        f"🗓 Finestra dati: <b>{item.get('market_lookback_days', MARKET_LOOKBACK_DAYS)} giorni</b>\n"
-        f"🎯 Indice opportunità: <b>{opportunity_score(item)}</b>\n\n"
-        f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n"
-        f"Motivi: {html.escape(reasons)}\n\n"
-        f"🚦 <b>VERDETTO: {html.escape(verdict)}</b>\n\n"
-        f'<a href="{url}">APRI SUBITO L’ANNUNCIO</a>\n\n'
-        "Non acquistare senza verifica manuale."
+        f"📚 Confronti: <b>{item.get('comparables', 0)}</b> "
+        f"su {item.get('raw_comparables', 0)}\n"
+        f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n\n"
+        f"<b>PERCHÉ</b>\n{reasons}\n\n"
+        f"<b>DA VERIFICARE</b>\n{warnings}\n\n"
+        f'<a href="{url}">APRI DIRETTAMENTE L’ANNUNCIO</a>\n\n'
+        "Non acquistare senza prova e verifica manuale."
     )
 
 
@@ -1281,6 +1347,18 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             new_items_count=len(new_items),
         )
         estimate_market_values(new_items, history)
+
+        analyses = {item["id"]: analyze_deal(item) for item in new_items}
+        decision_counts = {
+            "COMPRA": 0,
+            "TRATTA": 0,
+            "MONITORA": 0,
+            "SCARTA": 0,
+            "DATI_INSUFFICIENTI": 0,
+        }
+        for analysis in analyses.values():
+            decision = analysis["decision"]
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
 
         valid_deals = [
             item for item in new_items
@@ -1334,6 +1412,11 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             "busy": False,
             "new": len(new_items),
             "valid": len(valid_deals),
+            "buy": decision_counts.get("COMPRA", 0),
+            "negotiate": decision_counts.get("TRATTA", 0),
+            "monitor": decision_counts.get("MONITORA", 0),
+            "discard": decision_counts.get("SCARTA", 0),
+            "insufficient": decision_counts.get("DATI_INSUFFICIENTI", 0),
             "diagnostics": diagnostics,
         }
 
@@ -1349,7 +1432,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Categorie attivato.\n\n"
+        "✅ Radar Affari Decision Engine v1.3 attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1383,6 +1466,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     await update.message.reply_text(
+        f"🧠 Versione: Decision Engine v1.3\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1425,9 +1509,14 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "✅ Controllo terminato.\n"
+        "✅ CONTROLLO TERMINATO\n\n"
         f"Nuovi annunci: {result['new']}\n"
-        f"Affari validi: {result['valid']}"
+        f"🟢 Compra: {result.get('buy', 0)}\n"
+        f"🟡 Tratta e verifica: {result.get('negotiate', 0)}\n"
+        f"👀 Monitora: {result.get('monitor', 0)}\n"
+        f"🔴 Scarta: {result.get('discard', 0)}\n"
+        f"⚪ Dati insufficienti: {result.get('insufficient', 0)}\n\n"
+        f"Avvisi inviabili: {result['valid']}"
     )
 
 
@@ -1671,7 +1760,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Collector: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v1.3: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
@@ -1682,5 +1771,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
