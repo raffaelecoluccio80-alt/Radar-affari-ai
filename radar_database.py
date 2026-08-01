@@ -275,23 +275,15 @@ class RadarDatabase:
             )
 
             if price_value is not None:
-                previous = conn.execute(
+                # v1.6: una riga per ogni rilevazione, non soltanto quando
+                # il prezzo cambia. Serve per misurare permanenza e frequenza.
+                conn.execute(
                     """
-                    SELECT price FROM price_observations
-                    WHERE listing_id = ?
-                    ORDER BY observed_at DESC, id DESC
-                    LIMIT 1
+                    INSERT INTO price_observations(listing_id, price, observed_at, scan_token)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (listing_id,),
-                ).fetchone()
-                if previous is None or float(previous["price"]) != price_value:
-                    conn.execute(
-                        """
-                        INSERT INTO price_observations(listing_id, price, observed_at, scan_token)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (listing_id, price_value, now, scan_token),
-                    )
+                    (listing_id, price_value, now, scan_token),
+                )
 
         return not exists
 

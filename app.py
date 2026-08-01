@@ -523,7 +523,10 @@ def add_item(
         "brand": product["brand"],
         "model": product["model"],
         "product_key": product["product_key"],
+        "source": "subito",
+        "category": source_label(source_url).lower(),
         "source_url": source_url,
+        "relevant": bool(matched),
     }
 
     current = items.get(item_id)
@@ -699,8 +702,18 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
             1 for item in relevant_items
             if item.get("price") is not None
         )
+        diagnostics["archivable"] = sum(
+            1 for item in all_listings
+            if item.get("id") and item.get("url")
+        )
+        diagnostics["archivable_priced"] = sum(
+            1 for item in all_listings
+            if item.get("price") is not None
+        )
 
-        return relevant_items, diagnostics
+        # v1.6: il collector riceve tutti gli annunci validi della categoria.
+        # La selezione per parole chiave avviene dopo il salvataggio SQLite.
+        return all_listings, diagnostics
 
     except Exception as exc:
         diagnostics["error"] = str(exc)
@@ -1279,10 +1292,21 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         unique_items = {str(item["id"]): item for item in all_extracted}.values()
         all_extracted = list(unique_items)
 
+        # v1.6: salviamo nel database ogni annuncio valido trovato nelle
+        # categorie configurate, anche quando non contiene una keyword.
+        # Solo gli annunci pertinenti vengono poi valutati economicamente.
+        new_archived_items: List[Dict[str, Any]] = []
+        relevant_items: List[Dict[str, Any]] = []
         new_items: List[Dict[str, Any]] = []
+
         for item in all_extracted:
-            if DB.upsert_listing(item, scan_token=scan_token):
-                new_items.append(item)
+            is_new = DB.upsert_listing(item, scan_token=scan_token)
+            if is_new:
+                new_archived_items.append(item)
+            if item.get("matched"):
+                relevant_items.append(item)
+                if is_new:
+                    new_items.append(item)
 
         all_sources_ok = bool(diagnostics) and all(not row.get("error") for row in diagnostics)
         if all_sources_ok:
@@ -1290,7 +1314,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
 
         update_collection_stats(
             diagnostics=diagnostics,
-            relevant_items=all_extracted,
+            relevant_items=relevant_items,
             new_items_count=len(new_items),
         )
         estimate_market_values(new_items)
@@ -1359,6 +1383,9 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         return {
             "busy": False,
             "new": len(new_items),
+            "archived": len(all_extracted),
+            "new_archived": len(new_archived_items),
+            "relevant": len(relevant_items),
             "valid": len(valid_deals),
             "buy": decision_counts.get("COMPRA", 0),
             "negotiate": decision_counts.get("TRATTA", 0),
@@ -1380,7 +1407,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v1.5 SQLite attivato.\n\n"
+        "✅ Radar Affari Decision Engine v1.6 Collector SQLite attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1404,7 +1431,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v1.5 SQLite\n"
+        f"🧠 Versione: Decision Engine v1.6 Collector SQLite\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1450,7 +1477,10 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "✅ CONTROLLO TERMINATO\n\n"
-        f"Nuovi annunci: {result['new']}\n"
+        f"Annunci letti e archiviati: {result.get('archived', 0)}\n"
+        f"Nuovi nel database: {result.get('new_archived', 0)}\n"
+        f"Annunci pertinenti: {result.get('relevant', 0)}\n"
+        f"Nuovi pertinenti: {result['new']}\n"
         f"🟢 Compra: {result.get('buy', 0)}\n"
         f"🟡 Tratta e verifica: {result.get('negotiate', 0)}\n"
         f"👀 Monitora: {result.get('monitor', 0)}\n"
@@ -1486,6 +1516,8 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"HTTP {diagnostics['status']}\n"
                 f"Link totali: {diagnostics['links']}\n"
                 f"URL annunci riconosciuti: {diagnostics['listing_urls']}\n"
+                f"Archiviabili: {diagnostics.get('archivable', 0)}\n"
+                f"Archiviabili con prezzo: {diagnostics.get('archivable_priced', 0)}\n"
                 f"Annunci pertinenti: {diagnostics['extracted']}\n"
                 f"Pertinenti con prezzo: {diagnostics['priced']}"
             )
@@ -1684,7 +1716,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v1.5 SQLite: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v1.6 Collector SQLite: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
