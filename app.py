@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from radar_database import RadarDatabase
+
 
 # ============================================================
 # CONFIGURAZIONE
@@ -35,7 +37,7 @@ MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
 MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
 MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
 
-# Parametri del motore di valutazione v1.3.
+# Parametri del motore di valutazione v1.5.
 # Il Radar usa solo confronti recenti, elimina prezzi anomali e assegna
 # un livello di attendibilità alla stima.
 MARKET_LOOKBACK_DAYS = max(int(os.getenv("MARKET_LOOKBACK_DAYS", "90")), 7)
@@ -117,6 +119,13 @@ STATE_FILE = DATA_DIR / "radar_state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
 HISTORY_FILE = DATA_DIR / "radar_history.json"
 STATS_FILE = DATA_DIR / "radar_stats.json"
+DB_FILE = DATA_DIR / "radar_affari.sqlite3"
+DB = RadarDatabase(DB_FILE)
+DB.migrate_json_files(
+    history_file=HISTORY_FILE,
+    state_file=STATE_FILE,
+    subscribers_file=SUBSCRIBERS_FILE,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -175,20 +184,15 @@ def save_json(path: Path, data: Any) -> None:
 
 
 def subscribers() -> List[int]:
-    values = load_json(SUBSCRIBERS_FILE, [])
-    return [int(value) for value in values]
+    return DB.subscribers()
 
 
 def add_subscriber(chat_id: int) -> None:
-    ids = set(subscribers())
-    ids.add(chat_id)
-    save_json(SUBSCRIBERS_FILE, sorted(ids))
+    DB.add_subscriber(chat_id)
 
 
 def remove_subscriber(chat_id: int) -> None:
-    ids = set(subscribers())
-    ids.discard(chat_id)
-    save_json(SUBSCRIBERS_FILE, sorted(ids))
+    DB.remove_subscriber(chat_id)
 
 
 # ============================================================
@@ -1001,66 +1005,33 @@ def market_confidence(
     return score, label
 
 
-def estimate_market_values(
-    items: List[Dict[str, Any]],
-    history: List[Dict[str, Any]],
-) -> None:
+def estimate_market_values(items: List[Dict[str, Any]]) -> None:
+    """Stima il mercato usando soltanto annunci attivi nel database.
+
+    Ogni annuncio viene confrontato con prodotti aventi lo stesso product_key,
+    escludendo se stesso. In questo modo gli annunci vecchi o scomparsi non
+    alzano artificialmente il valore di rivendita.
     """
-    Motore di valutazione v1.3.
-
-    Per ogni prodotto:
-    - considera un solo prezzo per annuncio;
-    - usa soltanto dati entro MARKET_LOOKBACK_DAYS;
-    - esclude l'annuncio che sta valutando;
-    - rimuove gli outlier;
-    - stima valore centrale e fascia prudenziale;
-    - assegna un punteggio di attendibilità.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        days=MARKET_LOOKBACK_DAYS
-    )
-
-    rows_by_product: Dict[str, List[Dict[str, Any]]] = {}
-
-    for row in history:
-        if not isinstance(row, dict):
-            continue
-
-        key = str(row.get("product_key") or "").strip().lower()
-        price = row.get("price")
-        last_seen = parse_iso_datetime(
-            row.get("last_seen") or row.get("first_seen")
-        )
-
-        if (
-            not key
-            or not isinstance(price, (int, float))
-            or float(price) <= 0
-            or last_seen is None
-            or last_seen < cutoff
-        ):
-            continue
-
-        rows_by_product.setdefault(key, []).append({
-            "id": str(row.get("id") or ""),
-            "price": float(price),
-            "last_seen": last_seen,
-        })
-
     for item in items:
         asking_price = item.get("price")
         key = str(item.get("product_key") or "").strip().lower()
         item_id = str(item.get("id") or "")
 
-        raw_rows = [
-            row for row in rows_by_product.get(key, [])
-            if row["id"] != item_id
+        comparable_rows = DB.active_comparables(
+            key,
+            exclude_listing_id=item_id,
+            max_age_days=MARKET_LOOKBACK_DAYS,
+        ) if key else []
+
+        raw_prices = [
+            float(row["price"])
+            for row in comparable_rows
+            if isinstance(row.get("price"), (int, float)) and float(row["price"]) > 0
         ]
-        raw_prices = [row["price"] for row in raw_rows]
         comparable_prices = remove_price_outliers(raw_prices)
 
         newest_seen = max(
-            (row["last_seen"] for row in raw_rows),
+            (parse_iso_datetime(row.get("last_seen_at")) for row in comparable_rows),
             default=None,
         )
         confidence_score, confidence_label = market_confidence(
@@ -1070,24 +1041,17 @@ def estimate_market_values(
 
         item["raw_comparables"] = len(raw_prices)
         item["comparables"] = len(comparable_prices)
-        item["outliers_removed"] = max(
-            0,
-            len(raw_prices) - len(comparable_prices),
-        )
+        item["outliers_removed"] = max(0, len(raw_prices) - len(comparable_prices))
         item["confidence_score"] = confidence_score
         item["confidence_label"] = confidence_label
         item["market_lookback_days"] = MARKET_LOOKBACK_DAYS
 
         if comparable_prices:
-            item["market_low"] = round(
-                percentile(comparable_prices, 0.25),
-                2,
-            )
-            item["market_high"] = round(
-                percentile(comparable_prices, 0.75),
-                2,
-            )
+            item["market_min"] = round(min(comparable_prices), 2)
+            item["market_low"] = round(percentile(comparable_prices, 0.25), 2)
+            item["market_high"] = round(percentile(comparable_prices, 0.75), 2)
         else:
+            item["market_min"] = None
             item["market_low"] = None
             item["market_high"] = None
 
@@ -1101,36 +1065,25 @@ def estimate_market_values(
             item["quick_sale_value"] = None
             item["estimated_costs"] = None
             item["estimated_margin"] = None
+            item["maximum_buy_price"] = None
             item["roi"] = None
             continue
 
         market_value = float(median(comparable_prices))
-
-        # Vendita rapida prudenziale: usiamo il valore più basso tra
-        # il 25° percentile e il 90% della mediana.
         quick_sale_value = min(
+            min(comparable_prices),
             percentile(comparable_prices, 0.25),
             market_value * 0.90,
         )
-
-        estimated_costs = max(
-            25.0,
-            float(asking_price) * 0.06,
-        )
-        estimated_margin = (
-            quick_sale_value
-            - float(asking_price)
-            - estimated_costs
-        )
-        roi = (
-            estimated_margin / float(asking_price) * 100
-            if float(asking_price) > 0
-            else 0
-        )
+        estimated_costs = max(25.0, float(asking_price) * 0.06)
+        maximum_buy_price = max(0.0, quick_sale_value - estimated_costs - MIN_MARGIN_EURO)
+        estimated_margin = quick_sale_value - float(asking_price) - estimated_costs
+        roi = estimated_margin / float(asking_price) * 100 if float(asking_price) > 0 else 0
 
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
         item["estimated_costs"] = round(estimated_costs, 2)
+        item["maximum_buy_price"] = round(maximum_buy_price, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
 
@@ -1280,6 +1233,7 @@ def build_message(item: Dict[str, Any]) -> str:
         f"<b>{title}</b>\n"
         f"🧩 Prodotto: <b>{html.escape(product_name)}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
+        f"📉 Prezzo minimo concorrenti: <b>{euro(item.get('market_min'))}</b>\n"
         f"📊 Valore mediano stimato: <b>{euro(item.get('market_value'))}</b>\n"
         f"⚡ Rivendita rapida prudente: <b>{euro(item.get('quick_sale_value'))}</b>\n"
         f"🏷 Sconto sul mercato: <b>{discount_text}</b>\n"
@@ -1305,29 +1259,15 @@ def build_message(item: Dict[str, Any]) -> str:
 
 async def scan_once(application: Application) -> Dict[str, Any]:
     if SCAN_LOCK.locked():
-        return {
-            "busy": True,
-            "new": 0,
-            "valid": 0,
-            "diagnostics": [],
-        }
+        return {"busy": True, "new": 0, "valid": 0, "diagnostics": []}
 
     async with SCAN_LOCK:
         if not SOURCE_URLS:
             log.warning("Nessuna SOURCE_URL configurata.")
-            return {
-                "busy": False,
-                "new": 0,
-                "valid": 0,
-                "diagnostics": [],
-            }
+            return {"busy": False, "new": 0, "valid": 0, "diagnostics": []}
 
-        state = load_json(STATE_FILE, {"observed": [], "notified": []})
-        observed = set(state.get("observed", []))
-        notified = set(state.get("notified", []))
-
+        scan_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         all_extracted: List[Dict[str, Any]] = []
-        new_items: List[Dict[str, Any]] = []
         diagnostics: List[Dict[str, Any]] = []
 
         for source_url in SOURCE_URLS:
@@ -1335,36 +1275,59 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             diagnostics.append(source_diagnostics)
             all_extracted.extend(extracted_items)
 
-            for item in extracted_items:
-                if item["id"] not in observed:
-                    observed.add(item["id"])
-                    new_items.append(item)
+        # Deduplica eventuali annunci presenti in più fonti/categorie.
+        unique_items = {str(item["id"]): item for item in all_extracted}.values()
+        all_extracted = list(unique_items)
 
-        history = update_history(all_extracted)
+        new_items: List[Dict[str, Any]] = []
+        for item in all_extracted:
+            if DB.upsert_listing(item, scan_token=scan_token):
+                new_items.append(item)
+
+        all_sources_ok = bool(diagnostics) and all(not row.get("error") for row in diagnostics)
+        if all_sources_ok:
+            DB.mark_missing_after_scan(scan_token, source="subito", grace_hours=24)
+
         update_collection_stats(
             diagnostics=diagnostics,
             relevant_items=all_extracted,
             new_items_count=len(new_items),
         )
-        estimate_market_values(new_items, history)
+        estimate_market_values(new_items)
 
-        analyses = {item["id"]: analyze_deal(item) for item in new_items}
+        analyses: Dict[str, Dict[str, Any]] = {}
         decision_counts = {
-            "COMPRA": 0,
-            "TRATTA": 0,
-            "MONITORA": 0,
-            "SCARTA": 0,
-            "DATI_INSUFFICIENTI": 0,
+            "COMPRA": 0, "TRATTA": 0, "MONITORA": 0,
+            "SCARTA": 0, "DATI_INSUFFICIENTI": 0,
         }
-        for analysis in analyses.values():
-            decision = analysis["decision"]
-            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+
+        for item in new_items:
+            analysis = analyze_deal(item)
+            analyses[item["id"]] = analysis
+            item["decision"] = analysis["decision"]
+            item["rejection_reason"] = "; ".join(analysis.get("warnings", []))
+            decision_counts[analysis["decision"]] = decision_counts.get(analysis["decision"], 0) + 1
+            DB.record_evaluation(
+                item["id"],
+                {
+                    "asking_price": item.get("price"),
+                    "estimated_sale_price": item.get("quick_sale_value"),
+                    "maximum_buy_price": item.get("maximum_buy_price") or analysis.get("max_offer"),
+                    "gross_margin": item.get("estimated_margin"),
+                    "net_margin": item.get("estimated_margin"),
+                    "roi": item.get("roi"),
+                    "comparables_count": item.get("comparables", 0),
+                    "confidence": item.get("confidence_score", 0),
+                    "decision": analysis["decision"],
+                    "rejection_reason": item["rejection_reason"],
+                },
+            )
 
         valid_deals = [
             item for item in new_items
-            if item["id"] not in notified and is_valid_deal(item)
+            if not DB.was_notified(item["id"])
+            and analyses[item["id"]]["decision"] in {"COMPRA", "TRATTA"}
         ]
-
         valid_deals.sort(
             key=lambda item: (
                 opportunity_score(item),
@@ -1377,37 +1340,22 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         for item in valid_deals[:MAX_ALERTS_PER_SCAN]:
             message = build_message(item)
             sent_to_at_least_one = False
-
             for chat_id in subscribers():
                 try:
                     await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode="HTML",
+                        chat_id=chat_id, text=message, parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
                     sent_to_at_least_one = True
                 except Exception as exc:
                     log.warning("Invio fallito verso %s: %s", chat_id, exc)
-
             if sent_to_at_least_one:
-                notified.add(item["id"])
-
-        save_json(
-            STATE_FILE,
-            {
-                "observed": list(observed)[-10000:],
-                "notified": list(notified)[-5000:],
-            },
-        )
+                DB.mark_notified(item["id"], item.get("decision", "AFFARE"))
 
         log.info(
-            "SCAN nuovi=%s affari_validi=%s iscritti=%s",
-            len(new_items),
-            len(valid_deals),
-            len(subscribers()),
+            "SCAN nuovi=%s affari_validi=%s iscritti=%s db=%s",
+            len(new_items), len(valid_deals), len(subscribers()), DB_FILE,
         )
-
         return {
             "busy": False,
             "new": len(new_items),
@@ -1432,7 +1380,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v1.3 attivato.\n\n"
+        "✅ Radar Affari Decision Engine v1.5 SQLite attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1453,35 +1401,27 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    history = load_json(HISTORY_FILE, [])
-    state = load_json(STATE_FILE, {"observed": [], "notified": []})
+    db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
-
-    identified_models = {
-        str(row.get("product_key"))
-        for row in history
-        if isinstance(row, dict)
-        and row.get("product_key")
-        and ":" in str(row.get("product_key"))
-    }
-
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v1.3\n"
+        f"🧠 Versione: Decision Engine v1.5 SQLite\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
         f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"🛡 Attendibilità minima: {MIN_CONFIDENCE_SCORE}/100\n"
-        f"📅 Storico utilizzato: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
+        f"📅 Confronti attivi: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
         f"📚 Confronti minimi per stima: {MIN_COMPARABLES}\n"
-        f"📚 Annunci nel Collector: {len(history)}\n"
-        f"🧩 Modelli identificati: {len(identified_models)}\n"
+        f"🗄 Annunci nel database: {db_stats['total']}\n"
+        f"✅ Annunci attivi: {db_stats['active']}\n"
+        f"⚠️ Annunci scomparsi: {db_stats['missing']}\n"
+        f"🧩 Annunci riconosciuti: {db_stats['recognized']}\n"
+        f"💶 Osservazioni prezzo: {db_stats['price_observations']}\n"
+        f"🧮 Valutazioni salvate: {db_stats['evaluations']}\n"
         f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
-        f"👁 Annunci osservati: {len(state.get('observed', []))}\n"
-        f"🔔 Annunci notificati: {len(state.get('notified', []))}\n"
         f"👥 Iscritti: {len(subscribers())}\n"
-        f"💾 Cartella dati: {DATA_DIR}"
+        f"💾 Database: {DB_FILE}"
     )
 
 
@@ -1659,38 +1599,22 @@ async def collector(
     if update.message is None:
         return
 
-    history = load_json(HISTORY_FILE, [])
+    db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
-
-    by_product: Dict[str, int] = {}
-    price_changes = 0
-
-    for row in history:
-        if not isinstance(row, dict):
-            continue
-
-        key = str(row.get("product_key") or "non identificato")
-        by_product[key] = by_product.get(key, 0) + 1
-
-        if len(row.get("price_history", [])) > 1:
-            price_changes += 1
-
-    top_products = sorted(
-        by_product.items(),
-        key=lambda pair: pair[1],
-        reverse=True,
-    )[:8]
-
+    top_products = DB.product_counts(8)
     top_text = "\n".join(
-        f"• {name}: {count}"
-        for name, count in top_products
+        f"• {row['product_key']}: {row['count']}" for row in top_products
     ) or "• nessun dato"
 
     await update.message.reply_text(
-        "🗄 STATO COLLECTOR\n\n"
-        f"Annunci archiviati: {len(history)}\n"
-        f"Scansioni registrate: {int(stats.get('scans', 0))}\n"
-        f"Annunci con variazioni prezzo: {price_changes}\n\n"
+        "🗄 STATO COLLECTOR SQLITE\n\n"
+        f"Annunci archiviati: {db_stats['total']}\n"
+        f"Annunci attivi: {db_stats['active']}\n"
+        f"Annunci scomparsi: {db_stats['missing']}\n"
+        f"Osservazioni prezzo: {db_stats['price_observations']}\n"
+        f"Annunci con variazioni prezzo: {DB.price_change_listings_count()}\n"
+        f"Valutazioni registrate: {db_stats['evaluations']}\n"
+        f"Scansioni registrate: {int(stats.get('scans', 0))}\n\n"
         f"Prodotti più raccolti:\n{top_text}"
     )
 
@@ -1699,10 +1623,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    save_json(STATE_FILE, {"observed": [], "notified": []})
+    removed = DB.clear_notifications()
     await update.message.reply_text(
-        "♻️ Memoria annunci azzerata.\n"
-        "Lo storico prezzi è stato mantenuto."
+        f"♻️ Notifiche azzerate: {removed}.\n"
+        "Il database degli annunci e lo storico prezzi sono stati mantenuti."
     )
 
 
@@ -1760,7 +1684,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v1.3: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v1.5 SQLite: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
