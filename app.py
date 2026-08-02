@@ -991,13 +991,19 @@ def comparable_rows_for_item(
     item: Dict[str, Any],
     rows: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    candidate_text = f"{item.get('title', '')} {item.get('text', '')}"
+    candidate_text = (
+        f"{item.get('title', '')} "
+        f"{item.get('text', item.get('description', ''))}"
+    )
     candidate_bucket = listing_condition_bucket(candidate_text)
 
     filtered: List[Dict[str, Any]] = []
 
     for row in rows:
-        row_text = f"{row.get('title', '')} {row.get('text', '')}"
+        row_text = (
+            f"{row.get('title', '')} "
+            f"{row.get('text', row.get('description', ''))}"
+        )
         row_bucket = listing_condition_bucket(row_text)
 
         if candidate_bucket == "damaged":
@@ -1006,8 +1012,13 @@ def comparable_rows_for_item(
         elif candidate_bucket == "incomplete":
             if row_bucket not in {"incomplete", "damaged"}:
                 continue
+        elif candidate_bucket == "premium":
+            # "Come nuovo", "pari al nuovo" e "nuovo" non devono azzerare
+            # il campione. Accettiamo premium e standard, ma mai rotti/incompleti.
+            if row_bucket in {"damaged", "incomplete"}:
+                continue
         else:
-            if row_bucket in {"damaged", "incomplete", "premium"}:
+            if row_bucket in {"damaged", "incomplete"}:
                 continue
 
         filtered.append(row)
@@ -1030,7 +1041,8 @@ def comparable_quality_score(
         f"{item.get('title', '')} {item.get('text', '')}"
     ).lower()
     row_text = normalize_text(
-        f"{row.get('title', '')} {row.get('text', '')}"
+        f"{row.get('title', '')} "
+        f"{row.get('text', row.get('description', ''))}"
     ).lower()
 
     if listing_condition_bucket(item_text) == listing_condition_bucket(row_text):
@@ -1166,7 +1178,8 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
             if weighted_prices else 0.0
         )
 
-        item["raw_comparables"] = len(raw_prices)
+        item["raw_comparables"] = rows_before_condition_filter
+        item["priced_comparables"] = len(raw_prices)
         item["comparables"] = len(comparable_prices)
         item["condition_excluded"] = condition_excluded
         item["outliers_removed"] = outliers_removed
@@ -1500,7 +1513,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             relevant_items=relevant_items,
             new_items_count=len(new_items),
         )
-        estimate_market_values(new_items)
+        estimate_market_values(relevant_items)
 
         analyses: Dict[str, Dict[str, Any]] = {}
         decision_counts = {
@@ -1511,7 +1524,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         global LAST_DECISION_DEBUG
         current_debug_rows: List[Dict[str, Any]] = []
 
-        for item in new_items:
+        for item in relevant_items:
             analysis = analyze_deal(item)
             analyses[item["id"]] = analysis
 
@@ -1532,6 +1545,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
                 "roi": item.get("roi"),
                 "comparables": item.get("comparables", 0),
                 "raw_comparables": item.get("raw_comparables", 0),
+                "priced_comparables": item.get("priced_comparables", 0),
                 "confidence_score": item.get("confidence_score", 0),
                 "confidence_label": item.get("confidence_label", "INSUFFICIENTE"),
                 "decision": analysis.get("decision"),
@@ -1565,7 +1579,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         )[:MAX_DECISION_DEBUG_ITEMS]
 
         valid_deals = [
-            item for item in new_items
+            item for item in relevant_items
             if not DB.was_notified(item["id"])
             and analyses[item["id"]]["decision"] in {"COMPRA", "TRATTA"}
         ]
@@ -1594,8 +1608,9 @@ async def scan_once(application: Application) -> Dict[str, Any]:
                 DB.mark_notified(item["id"], item.get("decision", "AFFARE"))
 
         log.info(
-            "SCAN nuovi=%s affari_validi=%s iscritti=%s db=%s",
-            len(new_items), len(valid_deals), len(subscribers()), DB.location_label,
+            "SCAN pertinenti=%s nuovi=%s affari_validi=%s iscritti=%s db=%s",
+            len(relevant_items), len(new_items), len(valid_deals),
+            len(subscribers()), DB.location_label,
         )
         return {
             "busy": False,
@@ -1735,7 +1750,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v2.1 Decision Debug attivato.\n\n"
+        "✅ Radar Affari Decision Engine v2.2 Market Comparables Fix attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1763,7 +1778,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v2.1 Decision Debug\n"
+        f"🧠 Versione: Decision Engine v2.2 Market Comparables Fix\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -2013,8 +2028,11 @@ def _decision_debug_block(row: Dict[str, Any], index: int) -> str:
         f"Rivendita prudente: {euro(row.get('quick_sale_value'))}\n"
         f"Margine: {euro(row.get('estimated_margin'))}\n"
         f"ROI: {row.get('roi') if row.get('roi') is not None else 'n/d'}%\n"
-        f"Comparabili: {row.get('comparables', 0)} "
-        f"su {row.get('raw_comparables', 0)}\n"
+        f"Comparabili validi: {row.get('comparables', 0)}\n"
+        f"Con prezzo dopo filtro condizione: "
+        f"{row.get('priced_comparables', 0)}\n"
+        f"Candidati DB prima dei filtri: "
+        f"{row.get('raw_comparables', 0)}\n"
         f"Attendibilità: {row.get('confidence_label', 'INSUFFICIENTE')} "
         f"({row.get('confidence_score', 0)}/100)\n"
         f"Radar score: {row.get('radar_score', 0)}/100\n"
@@ -2186,7 +2204,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v2.1 Decision Debug: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v2.2 Market Comparables Fix: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
