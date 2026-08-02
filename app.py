@@ -19,6 +19,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from radar_database import RadarDatabase
 from product_identifier import identify_product as catalog_identify_product
+from visual_analyzer import analyze_listing
 
 
 # ============================================================
@@ -1783,7 +1784,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v2.3 Economic Estimate attivato.\n\n"
+        "✅ Radar Affari Decision Engine v3.0 Vision Test attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1799,6 +1800,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/decisiondebug - dettaglio ultime valutazioni\n"
         "/topscarti - migliori scarti e quasi affari\n"
         "/topcompra - migliori compra e tratta\n"
+        "/visiontest URL - analisi foto di un annuncio\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1811,7 +1813,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v2.3 Economic Estimate\n"
+        f"🧠 Versione: Decision Engine v3.0 Vision Test\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -2168,6 +2170,78 @@ async def topcompra(
 
 
 
+def _vision_result_message(result: Dict[str, Any]) -> str:
+    defects = result.get("visible_defects") or []
+    accessories = result.get("visible_accessories") or []
+    fraud = result.get("counterfeit_or_fraud_signals") or []
+
+    defects_text = "\n".join(f"• {value}" for value in defects) or "• nessuno evidente"
+    accessories_text = "\n".join(f"• {value}" for value in accessories) or "• nessuno riconoscibile"
+    fraud_text = "\n".join(f"• {value}" for value in fraud) or "• nessun segnale evidente"
+
+    return (
+        "👁 RADAR VISION AI V1\n\n"
+        f"Annuncio: {result.get('listing_title') or '[titolo assente]'}\n"
+        f"Immagini analizzate: {result.get('images_analyzed', 0)}\n\n"
+        f"Categoria: {result.get('category') or 'non determinata'}\n"
+        f"Marca: {result.get('brand') or 'non determinata'}\n"
+        f"Modello: {result.get('model') or 'non determinato'}\n"
+        f"Variante: {result.get('variant') or 'non determinata'}\n"
+        f"Memoria/taglia: {result.get('storage_or_size') or 'non determinata'}\n"
+        f"Anno stimato: {result.get('estimated_year') or 'non determinato'}\n"
+        f"Condizione visibile: {result.get('visible_condition') or 'unknown'}\n"
+        f"Coerenza testo/foto: {result.get('text_image_consistency') or 'unknown'}\n"
+        f"Confidenza riconoscimento: {result.get('recognition_confidence', 0)}/100\n"
+        f"Confidenza condizione: {result.get('condition_confidence', 0)}/100\n\n"
+        f"DIFETTI VISIBILI\n{defects_text}\n\n"
+        f"ACCESSORI VISIBILI\n{accessories_text}\n\n"
+        f"SEGNALI DI RISCHIO\n{fraud_text}\n\n"
+        f"NOTE\n{result.get('notes') or 'nessuna'}\n\n"
+        f"Link: {result.get('listing_url') or ''}\n\n"
+        "L'analisi visiva non certifica funzionamento, autenticità o stato interno."
+    )
+
+
+async def visiontest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n/visiontest URL_ANNUNCIO\n\n"
+            "Esempio:\n/visiontest https://www.subito.it/..."
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        await update.message.reply_text("❌ Inserisci un URL completo.")
+        return
+
+    await update.message.reply_text(
+        "👁 Analisi immagini in corso… può richiedere fino a un minuto."
+    )
+
+    try:
+        result = await analyze_listing(url)
+        message = _vision_result_message(result)
+    except Exception as exc:
+        log.exception("Vision test fallito")
+        await update.message.reply_text(
+            f"❌ Vision AI non riuscita:\n{str(exc)[:900]}"
+        )
+        return
+
+    for start_index in range(0, len(message), 3900):
+        await update.message.reply_text(
+            message[start_index:start_index + 3900],
+            disable_web_page_preview=True,
+        )
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -2233,11 +2307,12 @@ def main() -> None:
     application.add_handler(CommandHandler("decisiondebug", decisiondebug))
     application.add_handler(CommandHandler("topscarti", topscarti))
     application.add_handler(CommandHandler("topcompra", topcompra))
+    application.add_handler(CommandHandler("visiontest", visiontest))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v2.3 Economic Estimate: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v3.0 Vision Test: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
