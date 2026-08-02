@@ -159,6 +159,9 @@ HEADERS = {
 
 SCAN_LOCK = asyncio.Lock()
 
+LAST_DECISION_DEBUG: List[Dict[str, Any]] = []
+MAX_DECISION_DEBUG_ITEMS = 50
+
 
 
 def source_label(url: str) -> str:
@@ -1505,9 +1508,39 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             "SCARTA": 0, "DATI_INSUFFICIENTI": 0,
         }
 
+        global LAST_DECISION_DEBUG
+        current_debug_rows: List[Dict[str, Any]] = []
+
         for item in new_items:
             analysis = analyze_deal(item)
             analyses[item["id"]] = analysis
+
+            current_debug_rows.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "product_key": item.get("product_key"),
+                "brand": item.get("brand"),
+                "model": item.get("model"),
+                "storage": item.get("storage"),
+                "price": item.get("price"),
+                "market_low": item.get("market_low"),
+                "market_high": item.get("market_high"),
+                "market_value": item.get("market_value"),
+                "quick_sale_value": item.get("quick_sale_value"),
+                "estimated_margin": item.get("estimated_margin"),
+                "roi": item.get("roi"),
+                "comparables": item.get("comparables", 0),
+                "raw_comparables": item.get("raw_comparables", 0),
+                "confidence_score": item.get("confidence_score", 0),
+                "confidence_label": item.get("confidence_label", "INSUFFICIENTE"),
+                "decision": analysis.get("decision"),
+                "label": analysis.get("label"),
+                "radar_score": analysis.get("radar_score"),
+                "max_offer": analysis.get("max_offer"),
+                "reasons": analysis.get("reasons", []),
+                "warnings": analysis.get("warnings", []),
+            })
             item["decision"] = analysis["decision"]
             item["rejection_reason"] = "; ".join(analysis.get("warnings", []))
             decision_counts[analysis["decision"]] = decision_counts.get(analysis["decision"], 0) + 1
@@ -1526,6 +1559,10 @@ async def scan_once(application: Application) -> Dict[str, Any]:
                     "rejection_reason": item["rejection_reason"],
                 },
             )
+
+        LAST_DECISION_DEBUG = (
+            current_debug_rows + LAST_DECISION_DEBUG
+        )[:MAX_DECISION_DEBUG_ITEMS]
 
         valid_deals = [
             item for item in new_items
@@ -1698,7 +1735,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v2.0 Product Identifier attivato.\n\n"
+        "✅ Radar Affari Decision Engine v2.1 Decision Debug attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1711,6 +1748,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test - prova Telegram\n"
         "/scan - scansione manuale\n"
         "/reclassify - riclassifica tutto lo storico\n"
+        "/decisiondebug - dettaglio ultime valutazioni\n"
+        "/topscarti - migliori scarti e quasi affari\n"
+        "/topcompra - migliori compra e tratta\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1723,7 +1763,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v2.0 Product Identifier\n"
+        f"🧠 Versione: Decision Engine v2.1 Decision Debug\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1933,7 +1973,7 @@ async def collector(
     ) or "• nessun dato"
 
     await update.message.reply_text(
-        "🗄 STATO COLLECTOR SQLITE\n\n"
+        "🗄 STATO COLLECTOR POSTGRESQL\n\n"
         f"Annunci archiviati: {db_stats['total']}\n"
         f"Annunci attivi: {db_stats['active']}\n"
         f"Annunci scomparsi: {db_stats['missing']}\n"
@@ -1943,6 +1983,138 @@ async def collector(
         f"Scansioni registrate: {int(stats.get('scans', 0))}\n\n"
         f"Prodotti più raccolti:\n{top_text}"
     )
+
+
+def _decision_debug_block(row: Dict[str, Any], index: int) -> str:
+    title = normalize_text(str(row.get("title") or ""))[:180]
+    url = str(row.get("url") or "")
+    product_key = str(row.get("product_key") or "non identificato")
+    decision = str(row.get("decision") or "DATI_INSUFFICIENTI")
+    label = str(row.get("label") or "")
+    reasons = row.get("reasons") or []
+    warnings = row.get("warnings") or []
+
+    reasons_text = (
+        "\n".join(f"✅ {reason}" for reason in reasons)
+        if reasons else "• nessun motivo positivo sufficiente"
+    )
+    warnings_text = (
+        "\n".join(f"⚠️ {warning}" for warning in warnings)
+        if warnings else "• nessun avviso specifico"
+    )
+
+    return (
+        f"#{index} {decision}\n"
+        f"{title}\n"
+        f"Prodotto: {product_key}\n"
+        f"Prezzo: {euro(row.get('price'))}\n"
+        f"Mercato: {euro(row.get('market_low'))} – {euro(row.get('market_high'))}\n"
+        f"Valore: {euro(row.get('market_value'))}\n"
+        f"Rivendita prudente: {euro(row.get('quick_sale_value'))}\n"
+        f"Margine: {euro(row.get('estimated_margin'))}\n"
+        f"ROI: {row.get('roi') if row.get('roi') is not None else 'n/d'}%\n"
+        f"Comparabili: {row.get('comparables', 0)} "
+        f"su {row.get('raw_comparables', 0)}\n"
+        f"Attendibilità: {row.get('confidence_label', 'INSUFFICIENTE')} "
+        f"({row.get('confidence_score', 0)}/100)\n"
+        f"Radar score: {row.get('radar_score', 0)}/100\n"
+        f"Offerta massima: {euro(row.get('max_offer'))}\n"
+        f"Verdetto: {label}\n\n"
+        f"PERCHÉ\n{reasons_text}\n\n"
+        f"PROBLEMI\n{warnings_text}\n"
+        f"Link: {url}"
+    )
+
+
+async def _send_debug_rows(
+    update: Update,
+    rows: List[Dict[str, Any]],
+    heading: str,
+    limit: int = 10,
+) -> None:
+    if update.message is None:
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            "⚠️ Nessuna valutazione disponibile.\n"
+            "Esegui prima /scan."
+        )
+        return
+
+    await update.message.reply_text(
+        f"{heading}\n"
+        f"Mostro {min(len(rows), limit)} valutazioni."
+    )
+
+    for index, row in enumerate(rows[:limit], start=1):
+        block = _decision_debug_block(row, index)
+        for start_index in range(0, len(block), 3900):
+            await update.message.reply_text(
+                block[start_index:start_index + 3900],
+                disable_web_page_preview=True,
+            )
+
+
+async def decisiondebug(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await _send_debug_rows(
+        update,
+        LAST_DECISION_DEBUG,
+        "🧪 DECISION DEBUG",
+        limit=10,
+    )
+
+
+async def topscarti(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    rows = [
+        row for row in LAST_DECISION_DEBUG
+        if row.get("decision") in {
+            "SCARTA", "MONITORA", "DATI_INSUFFICIENTI"
+        }
+    ]
+    rows.sort(
+        key=lambda row: (
+            float(row.get("radar_score") or 0),
+            float(row.get("estimated_margin") or 0),
+        ),
+        reverse=True,
+    )
+    await _send_debug_rows(
+        update,
+        rows,
+        "🔴 TOP SCARTI / QUASI AFFARI",
+        limit=10,
+    )
+
+
+async def topcompra(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    rows = [
+        row for row in LAST_DECISION_DEBUG
+        if row.get("decision") in {"COMPRA", "TRATTA"}
+    ]
+    rows.sort(
+        key=lambda row: (
+            float(row.get("radar_score") or 0),
+            float(row.get("estimated_margin") or 0),
+        ),
+        reverse=True,
+    )
+    await _send_debug_rows(
+        update,
+        rows,
+        "🟢 TOP COMPRA / TRATTA",
+        limit=10,
+    )
+
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2007,11 +2179,14 @@ def main() -> None:
     application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("reclassify", reclassify))
+    application.add_handler(CommandHandler("decisiondebug", decisiondebug))
+    application.add_handler(CommandHandler("topscarti", topscarti))
+    application.add_handler(CommandHandler("topcompra", topcompra))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v2.0 Product Identifier: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v2.1 Decision Debug: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
