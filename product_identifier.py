@@ -415,7 +415,7 @@
       ],
       "attributes": {
         "storage_pattern": "(?<!\\d)(64|128|256|512|1024)\\s*(?:gb|giga)\\b",
-        "storage_required_for_pricing": true,
+        "storage_required_for_pricing": True,
         "supported_storage_gb": [
           64,
           128,
