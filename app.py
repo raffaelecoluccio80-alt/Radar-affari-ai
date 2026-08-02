@@ -53,6 +53,16 @@ MIN_MARKET_DISCOUNT_PERCENT = float(
     os.getenv("MIN_MARKET_DISCOUNT_PERCENT", "12")
 )
 
+# Price Engine Pro v1.8
+# Limita l'impatto dei comparabili molto lontani dal prezzo centrale
+# e richiede un vantaggio reale rispetto alla fascia bassa del mercato.
+MAX_COMPARABLE_DEVIATION_PERCENT = float(
+    os.getenv("MAX_COMPARABLE_DEVIATION_PERCENT", "45")
+)
+MIN_DISCOUNT_VS_LOW_PERCENT = float(
+    os.getenv("MIN_DISCOUNT_VS_LOW_PERCENT", "5")
+)
+
 KEYWORDS = [
     value.strip().lower()
     for value in os.getenv(
@@ -718,7 +728,7 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
             if item.get("price") is not None
         )
 
-        # v1.6: il collector riceve tutti gli annunci validi della categoria.
+        # Il collector riceve tutti gli annunci validi della categoria.
         # La selezione per parole chiave avviene dopo il salvataggio SQLite.
         return all_listings, diagnostics
 
@@ -1081,12 +1091,96 @@ def comparable_rows_for_item(
 
     return filtered
 
-def estimate_market_values(items: List[Dict[str, Any]]) -> None:
-    """Stima il mercato usando soltanto annunci attivi nel database.
+def comparable_quality_score(
+    item: Dict[str, Any],
+    row: Dict[str, Any],
+) -> int:
+    """Assegna un punteggio 0-100 alla qualità del comparabile.
 
-    Ogni annuncio viene confrontato con prodotti aventi lo stesso product_key,
-    escludendo se stesso. In questo modo gli annunci vecchi o scomparsi non
-    alzano artificialmente il valore di rivendita.
+    Il product_key è già uguale perché la query DB lo impone. Il punteggio
+    premia condizioni simili e parole rilevanti condivise, senza pretendere
+    informazioni che spesso gli annunci non contengono.
+    """
+    score = 60
+
+    item_text = normalize_text(
+        f"{item.get('title', '')} {item.get('text', '')}"
+    ).lower()
+    row_text = normalize_text(
+        f"{row.get('title', '')} {row.get('text', '')}"
+    ).lower()
+
+    if listing_condition_bucket(item_text) == listing_condition_bucket(row_text):
+        score += 20
+
+    item_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", item_text)
+        if len(token) >= 3
+    }
+    row_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", row_text)
+        if len(token) >= 3
+    }
+
+    shared = item_tokens.intersection(row_tokens)
+    score += min(len(shared) * 2, 20)
+
+    return min(score, 100)
+
+
+def weighted_median(
+    values_and_weights: List[Tuple[float, float]],
+) -> float:
+    """Mediana pesata senza dipendenze esterne."""
+    if not values_and_weights:
+        raise ValueError("Campione pesato vuoto")
+
+    ordered = sorted(values_and_weights, key=lambda pair: pair[0])
+    total_weight = sum(max(weight, 0.0) for _, weight in ordered)
+
+    if total_weight <= 0:
+        return float(median([value for value, _ in ordered]))
+
+    threshold = total_weight / 2
+    cumulative = 0.0
+
+    for value, weight in ordered:
+        cumulative += max(weight, 0.0)
+        if cumulative >= threshold:
+            return float(value)
+
+    return float(ordered[-1][0])
+
+
+def filter_by_central_deviation(
+    prices: List[float],
+) -> List[float]:
+    """Secondo filtro prudenziale attorno alla mediana.
+
+    Serve soprattutto con campioni piccoli nei quali l'IQR può non eliminare
+    un annuncio chiaramente distante dal resto del mercato.
+    """
+    if len(prices) < 4:
+        return prices
+
+    center = float(median(prices))
+    if center <= 0:
+        return prices
+
+    max_deviation = MAX_COMPARABLE_DEVIATION_PERCENT / 100
+    filtered = [
+        price for price in prices
+        if abs(price - center) / center <= max_deviation
+    ]
+
+    return filtered if len(filtered) >= MIN_COMPARABLES else prices
+
+def estimate_market_values(items: List[Dict[str, Any]]) -> None:
+    """Price Engine Pro v1.8.
+
+    Usa soltanto comparabili attivi, con product_key preciso e condizione
+    omogenea. Applica due filtri anti-anomalia e una mediana pesata.
+    Restituisce anche una fascia di mercato e dettagli su esclusioni e qualità.
     """
     for item in items:
         asking_price = item.get("price")
@@ -1099,35 +1193,73 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
             max_age_days=MARKET_LOOKBACK_DAYS,
         ) if is_precise_product_key(key) else []
 
+        rows_before_condition_filter = len(comparable_rows)
         comparable_rows = comparable_rows_for_item(item, comparable_rows)
+        condition_excluded = max(
+            0,
+            rows_before_condition_filter - len(comparable_rows),
+        )
 
-        raw_prices = [
-            float(row["price"])
-            for row in comparable_rows
-            if isinstance(row.get("price"), (int, float)) and float(row["price"]) > 0
-        ]
-        comparable_prices = remove_price_outliers(raw_prices)
+        priced_rows: List[Tuple[Dict[str, Any], float]] = []
+        for row in comparable_rows:
+            price = row.get("price")
+            if isinstance(price, (int, float)) and float(price) > 0:
+                priced_rows.append((row, float(price)))
+
+        raw_prices = [price for _, price in priced_rows]
+        iqr_prices = remove_price_outliers(raw_prices)
+        comparable_prices = filter_by_central_deviation(iqr_prices)
+
+        allowed_prices = set(comparable_prices)
+        weighted_prices: List[Tuple[float, float]] = []
+
+        for row, price in priced_rows:
+            if price not in allowed_prices:
+                continue
+            quality = comparable_quality_score(item, row)
+            weighted_prices.append((price, max(quality, 1)))
 
         newest_seen = max(
-            (parse_iso_datetime(row.get("last_seen_at")) for row in comparable_rows),
+            (
+                parse_iso_datetime(row.get("last_seen_at"))
+                for row, price in priced_rows
+                if price in allowed_prices
+            ),
             default=None,
         )
+
         confidence_score, confidence_label = market_confidence(
             comparable_prices,
             newest_seen,
         )
 
+        outliers_removed = max(0, len(raw_prices) - len(comparable_prices))
+        average_quality = (
+            round(
+                sum(weight for _, weight in weighted_prices)
+                / len(weighted_prices),
+                1,
+            )
+            if weighted_prices else 0.0
+        )
+
         item["raw_comparables"] = len(raw_prices)
         item["comparables"] = len(comparable_prices)
-        item["outliers_removed"] = max(0, len(raw_prices) - len(comparable_prices))
+        item["condition_excluded"] = condition_excluded
+        item["outliers_removed"] = outliers_removed
+        item["average_comparable_quality"] = average_quality
         item["confidence_score"] = confidence_score
         item["confidence_label"] = confidence_label
         item["market_lookback_days"] = MARKET_LOOKBACK_DAYS
 
         if comparable_prices:
-            item["market_min"] = round(min(comparable_prices), 2)
-            item["market_low"] = round(percentile(comparable_prices, 0.25), 2)
-            item["market_high"] = round(percentile(comparable_prices, 0.75), 2)
+            market_min = min(comparable_prices)
+            market_low = percentile(comparable_prices, 0.25)
+            market_high = percentile(comparable_prices, 0.75)
+
+            item["market_min"] = round(market_min, 2)
+            item["market_low"] = round(market_low, 2)
+            item["market_high"] = round(market_high, 2)
         else:
             item["market_min"] = None
             item["market_low"] = None
@@ -1138,6 +1270,7 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
             or not is_precise_product_key(key)
             or len(comparable_prices) < MIN_COMPARABLES
             or confidence_score < MIN_CONFIDENCE_SCORE
+            or not weighted_prices
         ):
             item["market_value"] = None
             item["quick_sale_value"] = None
@@ -1145,17 +1278,38 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
             item["estimated_margin"] = None
             item["maximum_buy_price"] = None
             item["roi"] = None
+            item["discount_vs_market_low"] = None
             continue
 
-        market_value = float(median(comparable_prices))
+        market_value = weighted_median(weighted_prices)
+
+        # Rivendita prudente: il più basso tra il 20° percentile e il 90%
+        # della mediana pesata. Non usa mai il minimo assoluto come riferimento.
         quick_sale_value = min(
             percentile(comparable_prices, 0.20),
             market_value * 0.90,
         )
+
         estimated_costs = max(25.0, float(asking_price) * 0.06)
-        maximum_buy_price = max(0.0, quick_sale_value - estimated_costs - MIN_MARGIN_EURO)
-        estimated_margin = quick_sale_value - float(asking_price) - estimated_costs
-        roi = estimated_margin / float(asking_price) * 100 if float(asking_price) > 0 else 0
+        maximum_buy_price = max(
+            0.0,
+            quick_sale_value - estimated_costs - MIN_MARGIN_EURO,
+        )
+        estimated_margin = (
+            quick_sale_value - float(asking_price) - estimated_costs
+        )
+        roi = (
+            estimated_margin / float(asking_price) * 100
+            if float(asking_price) > 0
+            else 0
+        )
+
+        market_low = float(item["market_low"])
+        discount_vs_market_low = (
+            (market_low - float(asking_price)) / market_low * 100
+            if market_low > 0
+            else 0
+        )
 
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
@@ -1163,7 +1317,10 @@ def estimate_market_values(items: List[Dict[str, Any]]) -> None:
         item["maximum_buy_price"] = round(maximum_buy_price, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
-
+        item["discount_vs_market_low"] = round(
+            discount_vs_market_low,
+            1,
+        )
 
 def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     """Trasforma i dati economici in una decisione spiegabile."""
@@ -1175,6 +1332,7 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     asking_price = item.get("price")
     costs = item.get("estimated_costs")
     confidence = int(item.get("confidence_score") or 0)
+    discount_vs_market_low = item.get("discount_vs_market_low")
     precise_model = bool(item.get("model")) and is_precise_product_key(
         str(item.get("product_key") or "")
     )
@@ -1207,6 +1365,16 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
         else:
             warnings.append(
                 f"prezzo troppo vicino al mercato: sconto {discount_percent:.1f}%"
+            )
+
+    if isinstance(discount_vs_market_low, (int, float)):
+        if discount_vs_market_low >= MIN_DISCOUNT_VS_LOW_PERCENT:
+            reasons.append(
+                f"prezzo {discount_vs_market_low:.1f}% sotto la fascia bassa"
+            )
+        else:
+            warnings.append(
+                "prezzo non abbastanza sotto la fascia bassa del mercato"
             )
 
     if isinstance(roi, (int, float)):
@@ -1248,6 +1416,12 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     elif discount_percent is None or discount_percent < MIN_MARKET_DISCOUNT_PERCENT:
         decision = "SCARTA"
         label = "SCARTA: PREZZO TROPPO VICINO AL MERCATO"
+    elif (
+        not isinstance(discount_vs_market_low, (int, float))
+        or float(discount_vs_market_low) < MIN_DISCOUNT_VS_LOW_PERCENT
+    ):
+        decision = "SCARTA"
+        label = "SCARTA: NON È SOTTO LA FASCIA BASSA DEL MERCATO"
     elif (
         isinstance(max_offer, (int, float))
         and isinstance(asking_price, (int, float))
@@ -1329,8 +1503,8 @@ def build_message(item: Dict[str, Any]) -> str:
         f"<b>{title}</b>\n"
         f"🧩 Prodotto: <b>{html.escape(product_name)}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
-        f"📉 Prezzo minimo concorrenti: <b>{euro(item.get('market_min'))}</b>\n"
-        f"📊 Valore mediano stimato: <b>{euro(item.get('market_value'))}</b>\n"
+        f"📉 Fascia mercato: <b>{euro(item.get('market_low'))} – {euro(item.get('market_high'))}</b>\n"
+        f"📊 Valore centrale pesato: <b>{euro(item.get('market_value'))}</b>\n"
         f"⚡ Rivendita rapida prudente: <b>{euro(item.get('quick_sale_value'))}</b>\n"
         f"🏷 Sconto sul mercato: <b>{discount_text}</b>\n"
         f"🤝 Offerta massima prudente: <b>{euro(analysis.get('max_offer'))}</b>\n"
@@ -1339,8 +1513,11 @@ def build_message(item: Dict[str, Any]) -> str:
         f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
         f"🛡 Attendibilità: <b>{item.get('confidence_label', 'INSUFFICIENTE')}</b> "
         f"({item.get('confidence_score', 0)}/100)\n"
-        f"📚 Confronti: <b>{item.get('comparables', 0)}</b> "
+        f"📚 Confronti validi: <b>{item.get('comparables', 0)}</b> "
         f"su {item.get('raw_comparables', 0)}\n"
+        f"🧹 Esclusi per condizione: <b>{item.get('condition_excluded', 0)}</b>\n"
+        f"🚫 Prezzi anomali esclusi: <b>{item.get('outliers_removed', 0)}</b>\n"
+        f"🎯 Qualità media comparabili: <b>{item.get('average_comparable_quality', 0)}/100</b>\n"
         f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n\n"
         f"<b>PERCHÉ</b>\n{reasons}\n\n"
         f"<b>DA VERIFICARE</b>\n{warnings}\n\n"
@@ -1375,7 +1552,7 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         unique_items = {str(item["id"]): item for item in all_extracted}.values()
         all_extracted = list(unique_items)
 
-        # v1.6: salviamo nel database ogni annuncio valido trovato nelle
+        # Salviamo nel database ogni annuncio valido trovato nelle
         # categorie configurate, anche quando non contiene una keyword.
         # Solo gli annunci pertinenti vengono poi valutati economicamente.
         new_archived_items: List[Dict[str, Any]] = []
@@ -1490,7 +1667,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v1.7 Price Guard attivato.\n\n"
+        "✅ Radar Affari Decision Engine v1.8 Price Engine Pro attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1514,7 +1691,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v1.7 Price Guard\n"
+        f"🧠 Versione: Decision Engine v1.8 Price Engine Pro\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1524,6 +1701,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 Confronti attivi: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
         f"📚 Confronti minimi per stima: {MIN_COMPARABLES}\n"
         f"📉 Sconto minimo sul mercato: {MIN_MARKET_DISCOUNT_PERCENT:.0f}%\n"
+        f"📉 Sconto minimo sulla fascia bassa: {MIN_DISCOUNT_VS_LOW_PERCENT:.0f}%\n"
         f"🗄 Annunci nel database: {db_stats['total']}\n"
         f"✅ Annunci attivi: {db_stats['active']}\n"
         f"⚠️ Annunci scomparsi: {db_stats['missing']}\n"
@@ -1800,7 +1978,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v1.7 Price Guard: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v1.8 Price Engine Pro: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
