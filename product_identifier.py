@@ -2,26 +2,28 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 CATALOG_PATH = Path(__file__).with_name("products.json")
 
 
 def normalize_text(value: str) -> str:
-    """Normalizza il testo mantenendo separatori utili al riconoscimento."""
-    value = (value or "").lower()
-    value = value.replace("\u00a0", " ")
+    """Normalizza testo, accenti e separatori senza perdere dati utili."""
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = value.lower().replace("\u00a0", " ")
     value = re.sub(r"[_/|]+", " ", value)
-    value = re.sub(r"(?<=\d)-(?=\d)", "-", value)
+    value = re.sub(r"(?<=\d)[,](?=\d)", ".", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
 
 
 def compact_text(value: str) -> str:
-    """Versione compatta usata per alias come iphone15pro e 15pro."""
+    """Versione compatta: 'iPhone 15 Pro' -> 'iphone15pro'."""
     return re.sub(r"[^a-z0-9]+", "", normalize_text(value))
 
 
@@ -50,8 +52,22 @@ def clear_catalog_cache() -> None:
 def _safe_search(pattern: str, text: str) -> bool:
     try:
         return bool(re.search(pattern, text, flags=re.IGNORECASE))
-    except re.error:
+    except (re.error, TypeError):
         return False
+
+
+def _phrase_match(alias: str, text: str) -> bool:
+    """Match di una frase con confini alfanumerici."""
+    alias = normalize_text(alias)
+    if not alias:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _matches_brand(text: str, aliases: Iterable[str]) -> bool:
@@ -62,7 +78,7 @@ def _matches_brand(text: str, aliases: Iterable[str]) -> bool:
         if not alias:
             continue
 
-        if re.search(rf"\b{re.escape(alias)}\b", text):
+        if _phrase_match(alias, text):
             return True
 
         alias_compact = compact_text(alias)
@@ -72,39 +88,71 @@ def _matches_brand(text: str, aliases: Iterable[str]) -> bool:
     return False
 
 
-def _matches_model(text: str, model: Dict[str, Any]) -> bool:
-    patterns = model.get("patterns", [])
-    for pattern in patterns:
-        if _safe_search(str(pattern), text):
-            return True
-
+def _model_match_score(text: str, model: Dict[str, Any]) -> Tuple[int, str]:
+    """Restituisce punteggio e tipo di match del modello."""
     compact = compact_text(text)
-    aliases = model.get("aliases", [])
+    best_score = 0
+    best_source = ""
 
-    for raw_alias in aliases:
+    for pattern in model.get("patterns", []):
+        if _safe_search(str(pattern), text):
+            # I pattern del catalogo sono la prova più affidabile.
+            score = 100 + min(len(str(pattern)), 40)
+            if score > best_score:
+                best_score = score
+                best_source = "pattern"
+
+    for raw_alias in model.get("aliases", []):
         alias = normalize_text(str(raw_alias))
         if not alias:
             continue
 
-        # Alias con confini di parola: "iphone 15 pro", "15 pro".
-        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text):
-            return True
+        if _phrase_match(alias, text):
+            score = 90 + min(len(alias), 35)
+            if score > best_score:
+                best_score = score
+                best_source = "alias"
 
-        # Alias compatti: "iphone15pro", "15pro".
         alias_compact = compact_text(alias)
         if len(alias_compact) >= 4 and alias_compact in compact:
-            return True
+            score = 82 + min(len(alias_compact), 35)
+            if score > best_score:
+                best_score = score
+                best_source = "compact_alias"
 
-    return False
+    # Fallback sul nome canonico, utile anche se il catalogo non ha aliases.
+    model_name = normalize_text(str(model.get("name") or ""))
+    if model_name:
+        if _phrase_match(model_name, text):
+            score = 80 + min(len(model_name), 35)
+            if score > best_score:
+                best_score = score
+                best_source = "model_name"
+
+        model_compact = compact_text(model_name)
+        if len(model_compact) >= 4 and model_compact in compact:
+            score = 72 + min(len(model_compact), 35)
+            if score > best_score:
+                best_score = score
+                best_source = "compact_model_name"
+
+    return best_score, best_source
 
 
 def _extract_storage(text: str, attributes: Dict[str, Any]) -> str:
-    aliases = attributes.get("storage_aliases", {})
-    compact = compact_text(text)
+    """Estrae memoria evitando di confondere RAM, batteria o altri numeri."""
+    normalized = normalize_text(text)
+    compact = compact_text(normalized)
 
+    aliases = attributes.get("storage_aliases", {})
     if isinstance(aliases, dict):
-        # Prima controlliamo gli alias specifici, ad esempio 1 TB.
-        for raw_alias, raw_value in aliases.items():
+        # Alias più lunghi prima: 1024gb precede 1tb.
+        ordered_aliases = sorted(
+            aliases.items(),
+            key=lambda item: len(compact_text(str(item[0]))),
+            reverse=True,
+        )
+        for raw_alias, raw_value in ordered_aliases:
             alias_compact = compact_text(str(raw_alias))
             if alias_compact and alias_compact in compact:
                 try:
@@ -115,7 +163,7 @@ def _extract_storage(text: str, attributes: Dict[str, Any]) -> str:
     storage_pattern = attributes.get("storage_pattern")
     if storage_pattern:
         try:
-            match = re.search(str(storage_pattern), text, flags=re.IGNORECASE)
+            match = re.search(str(storage_pattern), normalized, flags=re.IGNORECASE)
         except re.error:
             match = None
 
@@ -126,19 +174,29 @@ def _extract_storage(text: str, attributes: Dict[str, Any]) -> str:
             except (IndexError, TypeError, ValueError):
                 pass
 
-    # Fallback prudente per scritture comuni non intercettate dal catalogo.
+    # Formati comuni: 256 GB, 256gb, 256 giga, 1 TB.
     fallback = re.search(
         r"(?<!\d)(64|128|256|512|1024)\s*(?:gb|giga)\b",
-        text,
+        normalized,
         flags=re.IGNORECASE,
     )
     if fallback:
         return f"{int(fallback.group(1))}GB"
 
-    if re.search(r"(?<!\d)1\s*tb\b", text, flags=re.IGNORECASE):
+    if re.search(r"(?<!\d)1\s*tb\b", normalized, flags=re.IGNORECASE):
         return "1024GB"
 
+    # Formati compatti frequenti nei titoli: iphone15pro256gb.
+    compact_match = re.search(r"(64|128|256|512|1024)(?:gb|giga)", compact)
+    if compact_match:
+        return f"{int(compact_match.group(1))}GB"
+
     return ""
+
+
+def _extract_year(text: str) -> str:
+    match = re.search(r"\b(20(?:1[5-9]|2[0-9]))\b", text)
+    return match.group(1) if match else ""
 
 
 def _empty_result() -> Dict[str, Any]:
@@ -154,19 +212,48 @@ def _empty_result() -> Dict[str, Any]:
     }
 
 
+def _family_can_match_without_brand(
+    family: Dict[str, Any],
+    model_name: str,
+    text: str,
+    storage: str,
+    model_score: int,
+) -> bool:
+    """Consente titoli abbreviati solo quando il segnale è abbastanza forte."""
+    family_name = normalize_text(str(family.get("family") or ""))
+    brand = normalize_text(str(family.get("brand") or ""))
+
+    # iPhone abbreviati: "15 Pro 256GB". Richiediamo variante distintiva
+    # oppure memoria esplicita, per non scambiare numeri generici per modelli.
+    if brand == "apple" and family_name == "iphone":
+        distinctive = bool(
+            re.search(
+                r"\b(?:pro|max|plus|mini|se|xr|xs)\b",
+                normalize_text(model_name),
+            )
+        )
+        return model_score >= 92 and (distinctive or bool(storage))
+
+    # Altri prodotti possono essere riconosciuti senza brand solo con match
+    # molto forte e nome sufficientemente distintivo (es. EP-2 Pro).
+    return model_score >= 110 and len(compact_text(model_name)) >= 5
+
+
 def identify_product(text: str) -> Dict[str, Any]:
     """Identifica marca, famiglia, modello e memoria.
 
-    La chiave economica viene creata solo quando sono presenti gli attributi
-    obbligatori per il confronto prezzi, come la memoria per gli iPhone.
+    Compatibile con l'interfaccia precedente. Analizza tutto il testo ricevuto
+    (titolo e descrizione, se app.py li concatena) e sceglie il candidato con
+    il punteggio più alto, invece di fermarsi al primo match generico.
     """
     lowered = normalize_text(text)
     if not lowered:
         return _empty_result()
 
     catalog = load_catalog()
+    candidates: List[Dict[str, Any]] = []
 
-    for family in catalog.get("families", []):
+    for family_index, family in enumerate(catalog.get("families", [])):
         if not isinstance(family, dict):
             continue
 
@@ -175,78 +262,117 @@ def identify_product(text: str) -> Dict[str, Any]:
             for alias in family.get("brand_aliases", [])
             if str(alias).strip()
         ]
+        brand_match = _matches_brand(lowered, brand_aliases)
 
-        if brand_aliases and not _matches_brand(lowered, brand_aliases):
-            continue
+        attributes = family.get("attributes", {})
+        if not isinstance(attributes, dict):
+            attributes = {}
 
+        storage = _extract_storage(lowered, attributes)
         models = family.get("models", [])
         if not isinstance(models, list):
             continue
 
-        # Manteniamo l'ordine del catalogo: i modelli più specifici devono
-        # precedere quelli generici (es. Pro Max prima di Pro e modello base).
-        for model in models:
+        for model_index, model in enumerate(models):
             if not isinstance(model, dict):
                 continue
 
-            if not _matches_model(lowered, model):
+            model_score, match_source = _model_match_score(lowered, model)
+            if model_score <= 0:
                 continue
 
             model_name = str(model.get("name") or "").strip()
-            attributes = family.get("attributes", {})
-            if not isinstance(attributes, dict):
-                attributes = {}
+            if not brand_match and not _family_can_match_without_brand(
+                family=family,
+                model_name=model_name,
+                text=lowered,
+                storage=storage,
+                model_score=model_score,
+            ):
+                continue
 
-            storage = _extract_storage(lowered, attributes)
-
-            year_match = re.search(r"\b(20(?:1[5-9]|2[0-9]))\b", lowered)
-            year = year_match.group(1) if year_match else ""
-
-            brand = str(family.get("brand") or "").strip()
-            family_name = str(family.get("family") or "").strip()
-
-            required_storage = bool(
-                attributes.get("storage_required_for_pricing", False)
-            )
-            precise = not required_storage or bool(storage)
-
-            key_parts = [brand, family_name, model_name]
+            # Premiamo presenza del brand e modelli specifici/lunghi.
+            total_score = model_score
+            if brand_match:
+                total_score += 45
             if storage:
-                key_parts.append(storage)
+                total_score += 12
+            total_score += min(len(compact_text(model_name)), 25)
 
-            product_key = (
-                ":".join(
-                    part.strip().lower()
-                    for part in key_parts
-                    if part and part.strip()
-                )
-                if precise
-                else ""
+            candidates.append(
+                {
+                    "family": family,
+                    "model": model,
+                    "attributes": attributes,
+                    "storage": storage,
+                    "brand_match": brand_match,
+                    "match_source": match_source,
+                    "score": total_score,
+                    "family_index": family_index,
+                    "model_index": model_index,
+                }
             )
 
-            pattern_match = any(
-                _safe_search(str(pattern), lowered)
-                for pattern in model.get("patterns", [])
-            )
+    if not candidates:
+        return _empty_result()
 
-            if precise and pattern_match:
-                confidence = 97
-            elif precise:
-                confidence = 92
-            elif pattern_match:
-                confidence = 74
-            else:
-                confidence = 70
+    # Punteggio maggiore; a parità, modello più specifico e poi ordine catalogo.
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            len(compact_text(str(item["model"].get("name") or ""))),
+            -item["family_index"],
+            -item["model_index"],
+        ),
+        reverse=True,
+    )
+    winner = candidates[0]
 
-            return {
-                "brand": brand,
-                "family": family_name,
-                "model": model_name,
-                "variant": "",
-                "storage": storage,
-                "year": year,
-                "product_key": product_key,
-                "recognition_confidence": confidence,
-            }
+    family = winner["family"]
+    model = winner["model"]
+    attributes = winner["attributes"]
+    storage = winner["storage"]
 
-    return _empty_result()
+    brand = str(family.get("brand") or "").strip()
+    family_name = str(family.get("family") or "").strip()
+    model_name = str(model.get("name") or "").strip()
+    year = _extract_year(lowered)
+
+    required_storage = bool(attributes.get("storage_required_for_pricing", False))
+    precise = not required_storage or bool(storage)
+
+    key_parts = [brand, family_name, model_name]
+    if storage:
+        key_parts.append(storage)
+
+    product_key = (
+        ":".join(
+            part.strip().lower()
+            for part in key_parts
+            if part and part.strip()
+        )
+        if precise
+        else ""
+    )
+
+    if precise and winner["brand_match"] and winner["match_source"] == "pattern":
+        confidence = 98
+    elif precise and winner["brand_match"]:
+        confidence = 95
+    elif precise:
+        confidence = 90
+    elif winner["brand_match"] and winner["match_source"] == "pattern":
+        confidence = 78
+    else:
+        confidence = 72
+
+    return {
+        "brand": brand,
+        "family": family_name,
+        "model": model_name,
+        "variant": "",
+        "storage": storage,
+        "year": year,
+        "product_key": product_key,
+        "recognition_confidence": confidence,
+    }
