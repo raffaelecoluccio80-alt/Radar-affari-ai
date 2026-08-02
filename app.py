@@ -1656,6 +1656,107 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         }
 
 
+
+def reclassify_database_listings() -> Dict[str, int]:
+    """Riclassifica tutti gli annunci già presenti nel database."""
+    stats = {
+        "total": 0,
+        "changed": 0,
+        "recognized": 0,
+        "cleared": 0,
+        "unchanged": 0,
+    }
+
+    with DB.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, description, brand, model, product_key
+            FROM listings
+            ORDER BY id
+            """
+        ).fetchall()
+
+        for row in rows:
+            stats["total"] += 1
+            combined_text = normalize_text(
+                f"{row['title'] or ''} {row['description'] or ''}"
+            )
+            product = identify_product(combined_text)
+
+            new_brand = str(product.get("brand") or "")
+            new_model = str(product.get("model") or "")
+            new_key = str(product.get("product_key") or "").lower()
+
+            old_brand = str(row["brand"] or "")
+            old_model = str(row["model"] or "")
+            old_key = str(row["product_key"] or "").lower()
+
+            if new_key:
+                stats["recognized"] += 1
+            elif old_key:
+                stats["cleared"] += 1
+
+            if (
+                new_brand == old_brand
+                and new_model == old_model
+                and new_key == old_key
+            ):
+                stats["unchanged"] += 1
+                continue
+
+            conn.execute(
+                """
+                UPDATE listings
+                SET brand = ?,
+                    model = ?,
+                    product_key = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_brand,
+                    new_model,
+                    new_key,
+                    datetime.now(timezone.utc).isoformat(),
+                    str(row["id"]),
+                ),
+            )
+            stats["changed"] += 1
+
+    return stats
+
+
+async def reclassify(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    await update.message.reply_text(
+        "🧠 Riclassificazione database in corso…"
+    )
+
+    try:
+        result = reclassify_database_listings()
+    except Exception as exc:
+        log.exception("Errore riclassificazione database")
+        await update.message.reply_text(
+            f"❌ Riclassificazione fallita:\n{str(exc)[:500]}"
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ RICLASSIFICAZIONE COMPLETATA\n\n"
+        f"Annunci analizzati: {result['total']}\n"
+        f"Annunci modificati: {result['changed']}\n"
+        f"Annunci con chiave precisa: {result['recognized']}\n"
+        f"Vecchie chiavi eliminate: {result['cleared']}\n"
+        f"Annunci già corretti: {result['unchanged']}\n\n"
+        "Ora esegui /collector e poi /scan."
+    )
+
+
 # ============================================================
 # COMANDI TELEGRAM
 # ============================================================
@@ -1667,7 +1768,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v1.8 Price Engine Pro attivato.\n\n"
+        "✅ Radar Affari Decision Engine v1.8.1 Reclassifier attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1679,6 +1780,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/debug - mostra cosa legge il parser\n"
         "/test - prova Telegram\n"
         "/scan - scansione manuale\n"
+        "/reclassify - riclassifica lo storico prodotti\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1691,7 +1793,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v1.8 Price Engine Pro\n"
+        f"🧠 Versione: Decision Engine v1.8.1 Reclassifier\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1974,11 +2076,12 @@ def main() -> None:
     application.add_handler(CommandHandler("categorie", categorie))
     application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("reclassify", reclassify))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v1.8 Price Engine Pro: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v1.8.1 Reclassifier: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
