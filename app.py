@@ -42,7 +42,7 @@ MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
 # Il Radar usa solo confronti recenti, elimina prezzi anomali e assegna
 # un livello di attendibilità alla stima.
 MARKET_LOOKBACK_DAYS = max(int(os.getenv("MARKET_LOOKBACK_DAYS", "90")), 7)
-MIN_COMPARABLES = max(int(os.getenv("MIN_COMPARABLES", "5")), 3)
+MIN_COMPARABLES = max(int(os.getenv("MIN_COMPARABLES", "3")), 3)
 GOOD_COMPARABLES = max(int(os.getenv("GOOD_COMPARABLES", "12")), MIN_COMPARABLES)
 HIGH_COMPARABLES = max(int(os.getenv("HIGH_COMPARABLES", "25")), GOOD_COMPARABLES)
 MIN_CONFIDENCE_SCORE = min(
@@ -305,8 +305,41 @@ def matching_keywords(text: str) -> List[str]:
 
 
 def identify_product(text: str) -> Dict[str, Any]:
-    """Compatibilità con il resto dell'app: usa il catalogo prodotti v2."""
-    return catalog_identify_product(text)
+    """Usa il catalogo prodotti v2 con controlli anti-falso-positivo."""
+    result = catalog_identify_product(text)
+    normalized = normalize_text(text).lower()
+
+    detected_model = str(result.get("model") or "").strip().lower()
+    product_key = str(result.get("product_key") or "").strip().lower()
+
+    # Sicurezza: modelli iPhone nuovi/non presenti nel catalogo non devono
+    # essere ricondotti per somiglianza a modelli precedenti.
+    mentions_iphone_17 = bool(
+        re.search(r"\biphone\s*17\b|\biphone\s*17\s*(air|pro|max|pro\s*max)\b", normalized)
+    )
+    mentions_iphone_air = bool(re.search(r"\biphone\s*(17\s*)?air\b", normalized))
+
+    if mentions_iphone_17 and "17" not in detected_model and ":17" not in product_key:
+        return {
+            "brand": "",
+            "model": "",
+            "variant": "",
+            "storage": "",
+            "recognition_confidence": 0,
+            "product_key": "unidentified",
+        }
+
+    if mentions_iphone_air and "air" not in detected_model and ":air" not in product_key:
+        return {
+            "brand": "",
+            "model": "",
+            "variant": "",
+            "storage": "",
+            "recognition_confidence": 0,
+            "product_key": "unidentified",
+        }
+
+    return result
 
 def is_probable_listing_url(url: str) -> bool:
     parsed = urlparse(url)
@@ -1750,7 +1783,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v2.2 Market Comparables Fix attivato.\n\n"
+        "✅ Radar Affari Decision Engine v2.3 Economic Estimate attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1778,7 +1811,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v2.2 Market Comparables Fix\n"
+        f"🧠 Versione: Decision Engine v2.3 Economic Estimate\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -2204,7 +2237,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v2.2 Market Comparables Fix: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v2.3 Economic Estimate: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
