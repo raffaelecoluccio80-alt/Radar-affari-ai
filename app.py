@@ -1742,7 +1742,11 @@ def reclassify_database_listings() -> Dict[str, int]:
 async def reclassify(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+) -> None
+    print(
+        f*VISIONTEST RICEVUTO | testo={update. 
+        flush=True 
+) 
     if update.message is None:
         return
 
