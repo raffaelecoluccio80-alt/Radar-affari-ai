@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from functools import lru_cache
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -70,6 +71,47 @@ def _phrase_match(alias: str, text: str) -> bool:
     )
 
 
+def _tokenize(value: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", normalize_text(value))
+
+
+def _fuzzy_phrase_score(alias: str, text: str) -> int:
+    """Score 0-100 per piccoli errori di battitura.
+
+    È volutamente prudente: lavora solo su finestre con lo stesso numero
+    di token e viene usato soltanto quando il marchio è già riconosciuto.
+    """
+    alias_tokens = _tokenize(alias)
+    text_tokens = _tokenize(text)
+    if not alias_tokens or len(alias_tokens) > len(text_tokens):
+        return 0
+
+    alias_compact = "".join(alias_tokens)
+    if len(alias_compact) < 5:
+        return 0
+
+    best = 0.0
+    width = len(alias_tokens)
+
+    for index in range(0, len(text_tokens) - width + 1):
+        window = text_tokens[index:index + width]
+        window_compact = "".join(window)
+
+        ratio = SequenceMatcher(
+            None, alias_compact, window_compact, autojunk=False
+        ).ratio()
+
+        # I numeri di modello devono coincidere: evita 14/15, 5/6 ecc.
+        alias_numbers = re.findall(r"\d+", alias_compact)
+        window_numbers = re.findall(r"\d+", window_compact)
+        if alias_numbers and alias_numbers != window_numbers:
+            continue
+
+        best = max(best, ratio)
+
+    return int(round(best * 100))
+
+
 def _matches_brand(text: str, aliases: Iterable[str]) -> bool:
     compact = compact_text(text)
 
@@ -88,7 +130,12 @@ def _matches_brand(text: str, aliases: Iterable[str]) -> bool:
     return False
 
 
-def _model_match_score(text: str, model: Dict[str, Any]) -> Tuple[int, str]:
+def _model_match_score(
+    text: str,
+    model: Dict[str, Any],
+    *,
+    allow_fuzzy: bool = False,
+) -> Tuple[int, str]:
     """Restituisce punteggio e tipo di match del modello."""
     compact = compact_text(text)
     best_score = 0
@@ -120,6 +167,14 @@ def _model_match_score(text: str, model: Dict[str, Any]) -> Tuple[int, str]:
                 best_score = score
                 best_source = "compact_alias"
 
+        if allow_fuzzy and len(alias_compact) >= 5:
+            fuzzy = _fuzzy_phrase_score(alias, text)
+            if fuzzy >= 90:
+                score = 68 + min(fuzzy - 90, 10) + min(len(alias_compact), 20)
+                if score > best_score:
+                    best_score = score
+                    best_source = "fuzzy_alias"
+
     # Fallback sul nome canonico, utile anche se il catalogo non ha aliases.
     model_name = normalize_text(str(model.get("name") or ""))
     if model_name:
@@ -135,6 +190,14 @@ def _model_match_score(text: str, model: Dict[str, Any]) -> Tuple[int, str]:
             if score > best_score:
                 best_score = score
                 best_source = "compact_model_name"
+
+        if allow_fuzzy and len(model_compact) >= 5:
+            fuzzy = _fuzzy_phrase_score(model_name, text)
+            if fuzzy >= 92:
+                score = 62 + min(fuzzy - 92, 8) + min(len(model_compact), 18)
+                if score > best_score:
+                    best_score = score
+                    best_source = "fuzzy_model_name"
 
     return best_score, best_source
 
@@ -277,7 +340,11 @@ def identify_product(text: str) -> Dict[str, Any]:
             if not isinstance(model, dict):
                 continue
 
-            model_score, match_source = _model_match_score(lowered, model)
+            model_score, match_source = _model_match_score(
+                lowered,
+                model,
+                allow_fuzzy=brand_match,
+            )
             if model_score <= 0:
                 continue
 
@@ -357,6 +424,10 @@ def identify_product(text: str) -> Dict[str, Any]:
 
     if precise and winner["brand_match"] and winner["match_source"] == "pattern":
         confidence = 98
+    elif precise and winner["brand_match"] and winner["match_source"] in {
+        "fuzzy_alias", "fuzzy_model_name"
+    }:
+        confidence = 88
     elif precise and winner["brand_match"]:
         confidence = 95
     elif precise:
