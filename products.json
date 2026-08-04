@@ -1,5 +1,5 @@
 {
-  "catalog_version": 2,
+  "catalog_version": 3,
   "families": [
     {
       "brand": "apple",
@@ -818,31 +818,139 @@
       "brand": "specialized",
       "family": "bike",
       "brand_aliases": [
-        "specialized"
+        "specialized",
+        "specialized bicycles"
       ],
       "models": [
         {
           "name": "Turbo Levo",
           "patterns": [
             "\\bturbo\\s*levo\\b"
+          ],
+          "aliases": [
+            "levo",
+            "turbo levo",
+            "turbolevo"
           ]
         },
         {
           "name": "Turbo Vado",
           "patterns": [
             "\\bturbo\\s*vado\\b"
+          ],
+          "aliases": [
+            "vado",
+            "turbo vado"
           ]
         },
         {
           "name": "Turbo Como",
           "patterns": [
             "\\bturbo\\s*como\\b"
+          ],
+          "aliases": [
+            "como",
+            "turbo como"
           ]
         },
         {
           "name": "Stumpjumper",
           "patterns": [
             "\\bstumpjumper\\b"
+          ],
+          "aliases": [
+            "stumpjumper",
+            "sj"
+          ]
+        },
+        {
+          "name": "Turbo Levo Expert Carbon",
+          "patterns": [
+            "\\bturbo\\s*levo\\s*expert\\s*carbon\\b"
+          ],
+          "aliases": [
+            "levo expert carbon",
+            "turbo levo expert carbon"
+          ]
+        },
+        {
+          "name": "Turbo Levo Comp Carbon",
+          "patterns": [
+            "\\bturbo\\s*levo\\s*comp\\s*carbon\\b"
+          ],
+          "aliases": [
+            "levo comp carbon",
+            "turbo levo comp carbon"
+          ]
+        },
+        {
+          "name": "Turbo Levo Comp Alloy",
+          "patterns": [
+            "\\bturbo\\s*levo\\s*comp\\s*(?:alloy|alu|alluminio)\\b"
+          ],
+          "aliases": [
+            "levo comp alloy",
+            "turbo levo comp alloy"
+          ]
+        },
+        {
+          "name": "Turbo Levo Comp",
+          "patterns": [
+            "\\bturbo\\s*levo\\s*comp\\b"
+          ],
+          "aliases": [
+            "levo comp",
+            "turbo levo comp"
+          ]
+        },
+        {
+          "name": "Turbo Levo SL",
+          "patterns": [
+            "\\bturbo\\s*levo\\s*sl\\b"
+          ],
+          "aliases": [
+            "levo sl",
+            "turbo levo sl"
+          ]
+        },
+        {
+          "name": "Turbo Kenevo SL",
+          "patterns": [
+            "\\bturbo\\s*kenevo\\s*sl\\b"
+          ],
+          "aliases": [
+            "kenevo sl",
+            "turbo kenevo sl"
+          ]
+        },
+        {
+          "name": "Turbo Kenevo",
+          "patterns": [
+            "\\bturbo\\s*kenevo\\b"
+          ],
+          "aliases": [
+            "kenevo",
+            "turbo kenevo"
+          ]
+        },
+        {
+          "name": "Turbo Vado SL",
+          "patterns": [
+            "\\bturbo\\s*vado\\s*sl\\b"
+          ],
+          "aliases": [
+            "vado sl",
+            "turbo vado sl"
+          ]
+        },
+        {
+          "name": "Stumpjumper EVO",
+          "patterns": [
+            "\\bstumpjumper\\s*evo\\b"
+          ],
+          "aliases": [
+            "stumpjumper evo",
+            "sj evo"
           ]
         }
       ]
@@ -851,36 +959,750 @@
       "brand": "trek",
       "family": "bike",
       "brand_aliases": [
-        "trek"
+        "trek",
+        "trek bikes",
+        "trek bicycle"
       ],
       "models": [
         {
           "name": "Rail",
           "patterns": [
-            "\\brail\\s*(?:5|7|9|9\\.7|9\\.8|9\\.9)?\\b"
+            "\\brail\\b"
+          ],
+          "aliases": [
+            "trek rail"
           ]
         },
         {
           "name": "Powerfly",
           "patterns": [
             "\\bpowerfly\\b"
+          ],
+          "aliases": [
+            "trek powerfly"
           ]
         },
         {
           "name": "Marlin",
           "patterns": [
             "\\bmarlin\\s*(?:5|6|7|8)?\\b"
+          ],
+          "aliases": [
+            "trek marlin"
           ]
         },
         {
           "name": "Domane",
           "patterns": [
             "\\bdomane\\b"
+          ],
+          "aliases": [
+            "trek domane"
+          ]
+        },
+        {
+          "name": "Émonda SL 6",
+          "patterns": [
+            "\\b(?:e|é)monda\\s*sl\\s*6\\b"
+          ],
+          "aliases": [
+            "emonda sl6",
+            "emonda sl 6",
+            "émonda sl 6"
+          ]
+        },
+        {
+          "name": "Émonda SL 5",
+          "patterns": [
+            "\\b(?:e|é)monda\\s*sl\\s*5\\b"
+          ],
+          "aliases": [
+            "emonda sl5",
+            "emonda sl 5",
+            "émonda sl 5"
+          ]
+        },
+        {
+          "name": "Émonda",
+          "patterns": [
+            "\\b(?:e|é)monda\\b"
+          ],
+          "aliases": [
+            "emonda",
+            "émonda"
+          ]
+        },
+        {
+          "name": "Rail 9.9",
+          "patterns": [
+            "\\brail\\s*9[.,]9\\b"
+          ],
+          "aliases": [
+            "rail 9.9",
+            "rail 99"
+          ]
+        },
+        {
+          "name": "Rail 9.8",
+          "patterns": [
+            "\\brail\\s*9[.,]8\\b"
+          ],
+          "aliases": [
+            "rail 9.8",
+            "rail 98"
+          ]
+        },
+        {
+          "name": "Rail 9.7",
+          "patterns": [
+            "\\brail\\s*9[.,]7\\b"
+          ],
+          "aliases": [
+            "rail 9.7",
+            "rail 97"
+          ]
+        },
+        {
+          "name": "Rail 9",
+          "patterns": [
+            "\\brail\\s*9\\b"
+          ],
+          "aliases": [
+            "rail 9"
+          ]
+        },
+        {
+          "name": "Rail 7",
+          "patterns": [
+            "\\brail\\s*7\\b"
+          ],
+          "aliases": [
+            "rail 7"
+          ]
+        },
+        {
+          "name": "Rail 5",
+          "patterns": [
+            "\\brail\\s*5\\b"
+          ],
+          "aliases": [
+            "rail 5"
+          ]
+        },
+        {
+          "name": "Powerfly FS",
+          "patterns": [
+            "\\bpowerfly\\s*fs\\b"
+          ],
+          "aliases": [
+            "powerfly fs"
+          ]
+        },
+        {
+          "name": "Fuel EXe",
+          "patterns": [
+            "\\bfuel\\s*exe\\b"
+          ],
+          "aliases": [
+            "fuel exe",
+            "fuel ex e"
+          ]
+        },
+        {
+          "name": "Fuel EX",
+          "patterns": [
+            "\\bfuel\\s*ex\\b"
+          ],
+          "aliases": [
+            "fuel ex"
+          ]
+        },
+        {
+          "name": "Marlin+",
+          "patterns": [
+            "\\bmarlin\\s*\\+\\b"
+          ],
+          "aliases": [
+            "marlin plus",
+            "marlin+"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "cube",
+      "family": "bike",
+      "brand_aliases": [
+        "cube",
+        "cube bikes"
+      ],
+      "models": [
+        {
+          "name": "Stereo Hybrid ONE77",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\s*one77\\b"
+          ],
+          "aliases": [
+            "stereo hybrid one77"
+          ]
+        },
+        {
+          "name": "Stereo Hybrid ONE55",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\s*one55\\b"
+          ],
+          "aliases": [
+            "stereo hybrid one55"
+          ]
+        },
+        {
+          "name": "Stereo Hybrid 160",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\s*160\\b"
+          ],
+          "aliases": [
+            "stereo hybrid 160"
+          ]
+        },
+        {
+          "name": "Stereo Hybrid 140",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\s*140\\b"
+          ],
+          "aliases": [
+            "stereo hybrid 140"
+          ]
+        },
+        {
+          "name": "Stereo Hybrid 120",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\s*120\\b"
+          ],
+          "aliases": [
+            "stereo hybrid 120"
+          ]
+        },
+        {
+          "name": "Stereo Hybrid",
+          "patterns": [
+            "\\bstereo\\s*hybrid\\b"
+          ],
+          "aliases": [
+            "cube stereo hybrid"
+          ]
+        },
+        {
+          "name": "Reaction Hybrid",
+          "patterns": [
+            "\\breaction\\s*hybrid\\b"
+          ],
+          "aliases": [
+            "cube reaction hybrid"
+          ]
+        },
+        {
+          "name": "Kathmandu Hybrid",
+          "patterns": [
+            "\\bkathmandu\\s*hybrid\\b"
+          ],
+          "aliases": [
+            "cube kathmandu hybrid"
+          ]
+        },
+        {
+          "name": "Nuride Hybrid",
+          "patterns": [
+            "\\bnuride\\s*hybrid\\b"
+          ],
+          "aliases": [
+            "cube nuride hybrid"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "orbea",
+      "family": "bike",
+      "brand_aliases": [
+        "orbea"
+      ],
+      "models": [
+        {
+          "name": "Rise LT",
+          "patterns": [
+            "\\brise\\s*lt\\b"
+          ],
+          "aliases": [
+            "orbea rise lt"
+          ]
+        },
+        {
+          "name": "Rise M-Team",
+          "patterns": [
+            "\\brise\\s*m[-\\s]?team\\b"
+          ],
+          "aliases": [
+            "rise m team",
+            "rise m-team"
+          ]
+        },
+        {
+          "name": "Rise M10",
+          "patterns": [
+            "\\brise\\s*m10\\b"
+          ],
+          "aliases": [
+            "rise m10"
+          ]
+        },
+        {
+          "name": "Rise M20",
+          "patterns": [
+            "\\brise\\s*m20\\b"
+          ],
+          "aliases": [
+            "rise m20"
+          ]
+        },
+        {
+          "name": "Rise H10",
+          "patterns": [
+            "\\brise\\s*h10\\b"
+          ],
+          "aliases": [
+            "rise h10"
+          ]
+        },
+        {
+          "name": "Rise H20",
+          "patterns": [
+            "\\brise\\s*h20\\b"
+          ],
+          "aliases": [
+            "rise h20"
+          ]
+        },
+        {
+          "name": "Rise",
+          "patterns": [
+            "\\brise\\b"
+          ],
+          "aliases": [
+            "orbea rise"
+          ]
+        },
+        {
+          "name": "Wild",
+          "patterns": [
+            "\\bwild\\b"
+          ],
+          "aliases": [
+            "orbea wild"
+          ]
+        },
+        {
+          "name": "Urrun",
+          "patterns": [
+            "\\burrun\\b"
+          ],
+          "aliases": [
+            "orbea urrun"
+          ]
+        },
+        {
+          "name": "Occam",
+          "patterns": [
+            "\\boccam\\b"
+          ],
+          "aliases": [
+            "orbea occam"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "scott",
+      "family": "bike",
+      "brand_aliases": [
+        "scott",
+        "scott bikes"
+      ],
+      "models": [
+        {
+          "name": "Patron eRIDE",
+          "patterns": [
+            "\\bpatron\\s*e[-\\s]?ride\\b"
+          ],
+          "aliases": [
+            "patron eride",
+            "patron e ride"
+          ]
+        },
+        {
+          "name": "Genius eRIDE",
+          "patterns": [
+            "\\bgenius\\s*e[-\\s]?ride\\b"
+          ],
+          "aliases": [
+            "genius eride",
+            "genius e ride"
+          ]
+        },
+        {
+          "name": "Genius",
+          "patterns": [
+            "\\bgenius\\b"
+          ],
+          "aliases": [
+            "scott genius"
+          ]
+        },
+        {
+          "name": "Strike eRIDE",
+          "patterns": [
+            "\\bstrike\\s*e[-\\s]?ride\\b"
+          ],
+          "aliases": [
+            "strike eride"
+          ]
+        },
+        {
+          "name": "Spark",
+          "patterns": [
+            "\\bspark\\b"
+          ],
+          "aliases": [
+            "scott spark"
+          ]
+        },
+        {
+          "name": "Aspect eRIDE",
+          "patterns": [
+            "\\baspect\\s*e[-\\s]?ride\\b"
+          ],
+          "aliases": [
+            "aspect eride"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "giant",
+      "family": "bike",
+      "brand_aliases": [
+        "giant",
+        "giant bicycles"
+      ],
+      "models": [
+        {
+          "name": "Trance X Advanced E+",
+          "patterns": [
+            "\\btrance\\s*x\\s*advanced\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "trance x advanced e+"
+          ]
+        },
+        {
+          "name": "Trance X E+",
+          "patterns": [
+            "\\btrance\\s*x\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "trance x e+"
+          ]
+        },
+        {
+          "name": "Trance E+",
+          "patterns": [
+            "\\btrance\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "trance e+"
+          ]
+        },
+        {
+          "name": "Reign E+",
+          "patterns": [
+            "\\breign\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "reign e+"
+          ]
+        },
+        {
+          "name": "Stance E+",
+          "patterns": [
+            "\\bstance\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "stance e+"
+          ]
+        },
+        {
+          "name": "Talon E+",
+          "patterns": [
+            "\\btalon\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "talon e+"
+          ]
+        },
+        {
+          "name": "Explore E+",
+          "patterns": [
+            "\\bexplore\\s*e\\+\\b"
+          ],
+          "aliases": [
+            "explore e+"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "haibike",
+      "family": "bike",
+      "brand_aliases": [
+        "haibike",
+        "hai bike"
+      ],
+      "models": [
+        {
+          "name": "AllMtn",
+          "patterns": [
+            "\\ball\\s*mtn\\b|\\ballmtn\\b"
+          ],
+          "aliases": [
+            "allmtn",
+            "all mtn"
+          ]
+        },
+        {
+          "name": "Nduro",
+          "patterns": [
+            "\\bnduro\\b"
+          ],
+          "aliases": [
+            "haibike nduro"
+          ]
+        },
+        {
+          "name": "AllTrail",
+          "patterns": [
+            "\\ball\\s*trail\\b|\\balltrail\\b"
+          ],
+          "aliases": [
+            "alltrail",
+            "all trail"
+          ]
+        },
+        {
+          "name": "Trekking",
+          "patterns": [
+            "\\btrekking\\b"
+          ],
+          "aliases": [
+            "haibike trekking"
+          ]
+        },
+        {
+          "name": "HardNine",
+          "patterns": [
+            "\\bhard\\s*nine\\b|\\bhardnine\\b"
+          ],
+          "aliases": [
+            "hardnine",
+            "hard nine"
+          ]
+        },
+        {
+          "name": "HardSeven",
+          "patterns": [
+            "\\bhard\\s*seven\\b|\\bhardseven\\b"
+          ],
+          "aliases": [
+            "hardseven",
+            "hard seven"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "cannondale",
+      "family": "bike",
+      "brand_aliases": [
+        "cannondale"
+      ],
+      "models": [
+        {
+          "name": "Moterra Neo Carbon",
+          "patterns": [
+            "\\bmoterra\\s*neo\\s*carbon\\b"
+          ],
+          "aliases": [
+            "moterra neo carbon"
+          ]
+        },
+        {
+          "name": "Moterra Neo",
+          "patterns": [
+            "\\bmoterra\\s*neo\\b"
+          ],
+          "aliases": [
+            "moterra neo"
+          ]
+        },
+        {
+          "name": "Habit Neo",
+          "patterns": [
+            "\\bhabit\\s*neo\\b"
+          ],
+          "aliases": [
+            "habit neo"
+          ]
+        },
+        {
+          "name": "Tesoro Neo",
+          "patterns": [
+            "\\btesoro\\s*neo\\b"
+          ],
+          "aliases": [
+            "tesoro neo"
+          ]
+        },
+        {
+          "name": "Topstone Neo",
+          "patterns": [
+            "\\btopstone\\s*neo\\b"
+          ],
+          "aliases": [
+            "topstone neo"
+          ]
+        },
+        {
+          "name": "Scalpel",
+          "patterns": [
+            "\\bscalpel\\b"
+          ],
+          "aliases": [
+            "cannondale scalpel"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "megamo",
+      "family": "bike",
+      "brand_aliases": [
+        "megamo"
+      ],
+      "models": [
+        {
+          "name": "Native",
+          "patterns": [
+            "\\bnative\\b"
+          ],
+          "aliases": [
+            "megamo native"
+          ]
+        },
+        {
+          "name": "Crave",
+          "patterns": [
+            "\\bcrave\\b"
+          ],
+          "aliases": [
+            "megamo crave"
+          ]
+        },
+        {
+          "name": "Kansas",
+          "patterns": [
+            "\\bkansas\\b"
+          ],
+          "aliases": [
+            "megamo kansas"
+          ]
+        },
+        {
+          "name": "Track",
+          "patterns": [
+            "\\btrack\\b"
+          ],
+          "aliases": [
+            "megamo track"
+          ]
+        },
+        {
+          "name": "West",
+          "patterns": [
+            "\\bwest\\b"
+          ],
+          "aliases": [
+            "megamo west"
+          ]
+        }
+      ]
+    },
+    {
+      "brand": "lee cougan",
+      "family": "bike",
+      "brand_aliases": [
+        "lee cougan",
+        "leecougan",
+        "lee-cougan"
+      ],
+      "models": [
+        {
+          "name": "Crossfire",
+          "patterns": [
+            "\\bcrossfire\\b"
+          ],
+          "aliases": [
+            "lee cougan crossfire"
+          ]
+        },
+        {
+          "name": "Rampage",
+          "patterns": [
+            "\\brampage\\b"
+          ],
+          "aliases": [
+            "lee cougan rampage"
+          ]
+        },
+        {
+          "name": "Quest",
+          "patterns": [
+            "\\bquest\\b"
+          ],
+          "aliases": [
+            "lee cougan quest"
+          ]
+        },
+        {
+          "name": "Edge",
+          "patterns": [
+            "\\bedge\\b"
+          ],
+          "aliases": [
+            "lee cougan edge"
+          ]
+        },
+        {
+          "name": "E-Citizen",
+          "patterns": [
+            "\\be[-\\s]?citizen\\b"
+          ],
+          "aliases": [
+            "e citizen",
+            "e-citizen"
           ]
         }
       ]
     }
   ],
   "product_brain_version": "2.1-apple",
-  "last_update": "2026-08-02"
+  "last_update": "2026-08-02",
+  "notes": "Sprint e-bike/bike: riconoscimento esteso per modelli osservati e principali famiglie."
 }
