@@ -1,5 +1,5 @@
 {
-  "catalog_version": 3,
+  "catalog_version": "3.2",
   "families": [
     {
       "brand": "apple",
@@ -952,6 +952,73 @@
             "stumpjumper evo",
             "sj evo"
           ]
+        },
+        {
+          "name": "Epic Expert",
+          "patterns": [
+            "\\bepic\\s*expert\\b"
+          ],
+          "aliases": [
+            "specialized epic expert",
+            "epic expert"
+          ]
+        },
+        {
+          "name": "Epic EVO",
+          "patterns": [
+            "\\bepic\\s*evo\\b"
+          ],
+          "aliases": [
+            "specialized epic evo",
+            "epic evo"
+          ]
+        },
+        {
+          "name": "Epic",
+          "patterns": [
+            "\\bepic\\b"
+          ],
+          "aliases": [
+            "specialized epic"
+          ]
+        },
+        {
+          "name": "Riprock",
+          "patterns": [
+            "\\briprock\\b"
+          ],
+          "aliases": [
+            "specialized riprock",
+            "rip rock"
+          ]
+        },
+        {
+          "name": "Rockhopper",
+          "patterns": [
+            "\\brockhopper\\b"
+          ],
+          "aliases": [
+            "specialized rockhopper",
+            "rock hopper"
+          ]
+        },
+        {
+          "name": "Chisel",
+          "patterns": [
+            "\\bchisel\\b"
+          ],
+          "aliases": [
+            "specialized chisel"
+          ]
+        },
+        {
+          "name": "Phenom",
+          "patterns": [
+            "\\bphenom\\b"
+          ],
+          "aliases": [
+            "specialized phenom"
+          ]
         }
       ]
     },
@@ -1456,6 +1523,61 @@
           "aliases": [
             "explore e+"
           ]
+        },
+        {
+          "name": "Trance X",
+          "patterns": [
+            "\\btrance\\s*x\\b"
+          ],
+          "aliases": [
+            "giant trance x",
+            "trance x"
+          ]
+        },
+        {
+          "name": "Trance",
+          "patterns": [
+            "\\btrance\\b"
+          ],
+          "aliases": [
+            "giant trance"
+          ]
+        },
+        {
+          "name": "Reign",
+          "patterns": [
+            "\\breign\\b"
+          ],
+          "aliases": [
+            "giant reign"
+          ]
+        },
+        {
+          "name": "Talon",
+          "patterns": [
+            "\\btalon\\b"
+          ],
+          "aliases": [
+            "giant talon"
+          ]
+        },
+        {
+          "name": "Fathom",
+          "patterns": [
+            "\\bfathom\\b"
+          ],
+          "aliases": [
+            "giant fathom"
+          ]
+        },
+        {
+          "name": "Anthem",
+          "patterns": [
+            "\\banthem\\b"
+          ],
+          "aliases": [
+            "giant anthem"
+          ]
         }
       ]
     },
@@ -1704,5 +1826,4 @@
   ],
   "product_brain_version": "2.1-apple",
   "last_update": "2026-08-02",
-  "notes": "Sprint e-bike/bike: riconoscimento esteso per modelli osservati e principali famiglie."
-}
+  "notes": "Recognition Engine v3.2: modelli Specialized/Giant osservati, parser iPhone migliorato e filtro accessori gestito dall'identificatore."
