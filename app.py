@@ -1432,7 +1432,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v1.3 attivato.\n\n"
+        "✅ Radar Affari Decision Engine v3.1 Vision + Knowledge attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1466,7 +1466,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v1.3\n"
+        f"🧠 Versione: Decision Engine v3.1 Vision + Knowledge\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1695,6 +1695,135 @@ async def collector(
     )
 
 
+def _vision_result_message(result: Dict[str, Any]) -> str:
+    defects = result.get("visible_defects") or []
+    accessories = result.get("visible_accessories") or []
+    fraud = result.get("counterfeit_or_fraud_signals") or []
+
+    defects_text = "\n".join(f"• {value}" for value in defects) or "• nessuno evidente"
+    accessories_text = "\n".join(f"• {value}" for value in accessories) or "• nessuno riconoscibile"
+    fraud_text = "\n".join(f"• {value}" for value in fraud) or "• nessun segnale evidente"
+
+    return (
+        "👁 RADAR VISION AI V1\n\n"
+        f"Annuncio: {result.get('listing_title') or '[titolo assente]'}\n"
+        f"Immagini analizzate: {result.get('images_analyzed', 0)}\n\n"
+        f"Categoria: {result.get('category') or 'non determinata'}\n"
+        f"Marca: {result.get('brand') or 'non determinata'}\n"
+        f"Modello: {result.get('model') or 'non determinato'}\n"
+        f"Variante: {result.get('variant') or 'non determinata'}\n"
+        f"Memoria/taglia: {result.get('storage_or_size') or 'non determinata'}\n"
+        f"Anno stimato: {result.get('estimated_year') or 'non determinato'}\n"
+        f"Condizione visibile: {result.get('visible_condition') or 'unknown'}\n"
+        f"Coerenza testo/foto: {result.get('text_image_consistency') or 'unknown'}\n"
+        f"Confidenza riconoscimento: {result.get('recognition_confidence', 0)}/100\n"
+        f"Confidenza condizione: {result.get('condition_confidence', 0)}/100\n\n"
+        f"DIFETTI VISIBILI\n{defects_text}\n\n"
+        f"ACCESSORI VISIBILI\n{accessories_text}\n\n"
+        f"SEGNALI DI RISCHIO\n{fraud_text}\n\n"
+        f"NOTE\n{result.get('notes') or 'nessuna'}\n\n"
+        f"Link: {result.get('listing_url') or ''}\n\n"
+        "L'analisi visiva non certifica funzionamento, autenticità o stato interno."
+    )
+
+
+def _knowledge_result_message(report: Dict[str, Any]) -> str:
+    if not report.get("supported"):
+        return (
+            "🧠 KNOWLEDGE ENGINE\n\n"
+            f"{report.get('message', 'Categoria non ancora supportata.')}"
+        )
+
+    repairs = report.get("repair_items") or []
+    repairs_text = "\n".join(
+        f"• {row.get('issue')}: {euro(row.get('min_cost'))} – {euro(row.get('max_cost'))} "
+        f"(gravità {row.get('severity', 'non definita')})"
+        for row in repairs
+    ) or "• Nessuna riparazione identificata dalle fotografie."
+
+    checklist_text = "\n".join(f"☐ {value}" for value in report.get("checklist") or [])
+    questions_text = "\n".join(f"• {value}" for value in report.get("questions_for_seller") or [])
+    no_buy_text = "\n".join(f"⛔ {value}" for value in report.get("do_not_buy_if") or [])
+
+    roi = report.get("roi")
+    roi_text = f"{roi}%" if roi is not None else "non disponibile"
+
+    return (
+        "🧠 RADAR KNOWLEDGE ENGINE V1\n\n"
+        f"🚦 Verdetto: {report.get('verdict', 'VERIFICA')}\n"
+        f"⭐ BUY SCORE: {report.get('buy_score', 0)}/100\n"
+        f"⚠️ Rischio tecnico: {report.get('risk_score', 0)}/100\n\n"
+        f"🔧 COSTI DI RIPARAZIONE\n{repairs_text}\n\n"
+        f"Totale minimo: {euro(report.get('repair_cost_min'))}\n"
+        f"Totale massimo prudente: {euro(report.get('repair_cost_max'))}\n"
+        f"Riduzione rivendibilità: {report.get('resale_penalty_percent', 0)}%\n\n"
+        f"💰 VALUTAZIONE ECONOMICA\n"
+        f"Rivendita prudente: {euro(report.get('prudent_resale_value'))}\n"
+        f"Prezzo massimo di acquisto: {euro(report.get('maximum_buy_price'))}\n"
+        f"Margine stimato: {euro(report.get('estimated_margin'))}\n"
+        f"ROI: {roi_text}\n\n"
+        f"📋 CHECKLIST PRE-ACQUISTO\n{checklist_text}\n\n"
+        f"❓ DOMANDE AL VENDITORE\n{questions_text}\n\n"
+        f"🚫 NON COMPRARE SE\n{no_buy_text}"
+    )
+
+
+async def visiontest(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n/visiontest URL_ANNUNCIO\n\n"
+            "Esempio:\n/visiontest https://www.subito.it/..."
+        )
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith(("http://", "https://")):
+        await update.message.reply_text("❌ Inserisci un URL completo.")
+        return
+
+    await update.message.reply_text(
+        "👁 Analisi Vision + Knowledge Engine in corso… può richiedere fino a un minuto."
+    )
+
+    try:
+        result = await analyze_listing(url)
+        vision_message = _vision_result_message(result)
+
+        asking_price = parse_price(
+            f"{result.get('listing_title', '')} "
+            f"{result.get('listing_description', '')}"
+        )
+
+        report = build_knowledge_report(
+            vision_result=result,
+            asking_price=asking_price,
+            market_value=None,
+            target_margin=MIN_MARGIN_EURO,
+            transaction_costs=25.0,
+        )
+        knowledge_message = _knowledge_result_message(report)
+        messages = [vision_message, knowledge_message]
+    except Exception as exc:
+        log.exception("Vision + Knowledge test fallito")
+        await update.message.reply_text(
+            f"❌ Analisi non riuscita:\n{str(exc)[:900]}"
+        )
+        return
+
+    for message in messages:
+        for start_index in range(0, len(message), 3900):
+            await update.message.reply_text(
+                message[start_index:start_index + 3900],
+                disable_web_page_preview=True,
+            )
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -1756,11 +1885,12 @@ def main() -> None:
     application.add_handler(CommandHandler("categorie", categorie))
     application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("visiontest", visiontest))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v1.3: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v3.1 Vision + Knowledge: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
