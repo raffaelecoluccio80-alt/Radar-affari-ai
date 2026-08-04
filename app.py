@@ -17,6 +17,9 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from visual_analyzer import analyze_listing
+from knowledge_engine import build_knowledge_report
+
 
 # ============================================================
 # CONFIGURAZIONE
