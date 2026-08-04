@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+from radar_database import RadarDatabase
+from product_identifier import identify_product as catalog_identify_product
 from visual_analyzer import analyze_listing
 from knowledge_engine import build_knowledge_report
 
@@ -38,16 +40,30 @@ MIN_MARGIN_EURO = float(os.getenv("MIN_MARGIN_EURO", "80"))
 MIN_ROI_PERCENT = float(os.getenv("MIN_ROI_PERCENT", "20"))
 MAX_ALERTS_PER_SCAN = max(int(os.getenv("MAX_ALERTS_PER_SCAN", "30")), 1)
 
-# Parametri del motore di valutazione v1.3.
+# Parametri del motore di valutazione v1.5.
 # Il Radar usa solo confronti recenti, elimina prezzi anomali e assegna
 # un livello di attendibilità alla stima.
 MARKET_LOOKBACK_DAYS = max(int(os.getenv("MARKET_LOOKBACK_DAYS", "90")), 7)
-MIN_COMPARABLES = max(int(os.getenv("MIN_COMPARABLES", "5")), 3)
+MIN_COMPARABLES = max(int(os.getenv("MIN_COMPARABLES", "3")), 3)
 GOOD_COMPARABLES = max(int(os.getenv("GOOD_COMPARABLES", "12")), MIN_COMPARABLES)
 HIGH_COMPARABLES = max(int(os.getenv("HIGH_COMPARABLES", "25")), GOOD_COMPARABLES)
 MIN_CONFIDENCE_SCORE = min(
     max(int(os.getenv("MIN_CONFIDENCE_SCORE", "45")), 0),
     100,
+)
+
+MIN_MARKET_DISCOUNT_PERCENT = float(
+    os.getenv("MIN_MARKET_DISCOUNT_PERCENT", "12")
+)
+
+# Price Engine Pro v1.8
+# Limita l'impatto dei comparabili molto lontani dal prezzo centrale
+# e richiede un vantaggio reale rispetto alla fascia bassa del mercato.
+MAX_COMPARABLE_DEVIATION_PERCENT = float(
+    os.getenv("MAX_COMPARABLE_DEVIATION_PERCENT", "45")
+)
+MIN_DISCOUNT_VS_LOW_PERCENT = float(
+    os.getenv("MIN_DISCOUNT_VS_LOW_PERCENT", "5")
 )
 
 KEYWORDS = [
@@ -120,6 +136,14 @@ STATE_FILE = DATA_DIR / "radar_state.json"
 SUBSCRIBERS_FILE = DATA_DIR / "radar_subscribers.json"
 HISTORY_FILE = DATA_DIR / "radar_history.json"
 STATS_FILE = DATA_DIR / "radar_stats.json"
+DB_FILE = DATA_DIR / "radar_affari.sqlite3"
+DATABASE_TARGET = os.getenv("DATABASE_URL", "").strip() or str(DB_FILE)
+DB = RadarDatabase(DATABASE_TARGET)
+DB.migrate_json_files(
+    history_file=HISTORY_FILE,
+    state_file=STATE_FILE,
+    subscribers_file=SUBSCRIBERS_FILE,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -136,6 +160,9 @@ HEADERS = {
 }
 
 SCAN_LOCK = asyncio.Lock()
+
+LAST_DECISION_DEBUG: List[Dict[str, Any]] = []
+MAX_DECISION_DEBUG_ITEMS = 50
 
 
 
@@ -178,20 +205,15 @@ def save_json(path: Path, data: Any) -> None:
 
 
 def subscribers() -> List[int]:
-    values = load_json(SUBSCRIBERS_FILE, [])
-    return [int(value) for value in values]
+    return DB.subscribers()
 
 
 def add_subscriber(chat_id: int) -> None:
-    ids = set(subscribers())
-    ids.add(chat_id)
-    save_json(SUBSCRIBERS_FILE, sorted(ids))
+    DB.add_subscriber(chat_id)
 
 
 def remove_subscriber(chat_id: int) -> None:
-    ids = set(subscribers())
-    ids.discard(chat_id)
-    save_json(SUBSCRIBERS_FILE, sorted(ids))
+    DB.remove_subscriber(chat_id)
 
 
 # ============================================================
@@ -284,91 +306,42 @@ def matching_keywords(text: str) -> List[str]:
     return [keyword for keyword in KEYWORDS if keyword in lowered]
 
 
-def identify_product(text: str) -> Dict[str, str]:
-    """Riconosce marca, modello e variante principale del prodotto.
+def identify_product(text: str) -> Dict[str, Any]:
+    """Usa il catalogo prodotti v2 con controlli anti-falso-positivo."""
+    result = catalog_identify_product(text)
+    normalized = normalize_text(text).lower()
 
-    Per gli iPhone include la memoria nel product_key, così modelli e tagli
-    differenti non vengono più mescolati nello stesso gruppo di confronto.
-    """
-    lowered = normalize_text(text).lower()
+    detected_model = str(result.get("model") or "").strip().lower()
+    product_key = str(result.get("product_key") or "").strip().lower()
 
-    iphone_rules: List[Tuple[str, str]] = [
-        (r"\biphone\s*15\s*pro\s*max\b", "iPhone 15 Pro Max"),
-        (r"\biphone\s*15\s*pro\b", "iPhone 15 Pro"),
-        (r"\biphone\s*15\s*plus\b", "iPhone 15 Plus"),
-        (r"\biphone\s*15\b", "iPhone 15"),
-        (r"\biphone\s*14\s*pro\s*max\b", "iPhone 14 Pro Max"),
-        (r"\biphone\s*14\s*pro\b", "iPhone 14 Pro"),
-        (r"\biphone\s*14\s*plus\b", "iPhone 14 Plus"),
-        (r"\biphone\s*14\b", "iPhone 14"),
-        (r"\biphone\s*13\s*pro\s*max\b", "iPhone 13 Pro Max"),
-        (r"\biphone\s*13\s*pro\b", "iPhone 13 Pro"),
-        (r"\biphone\s*13\s*mini\b", "iPhone 13 Mini"),
-        (r"\biphone\s*13\b", "iPhone 13"),
-        (r"\biphone\s*12\s*pro\s*max\b", "iPhone 12 Pro Max"),
-        (r"\biphone\s*12\s*pro\b", "iPhone 12 Pro"),
-        (r"\biphone\s*12\s*mini\b", "iPhone 12 Mini"),
-        (r"\biphone\s*12\b", "iPhone 12"),
-        (r"\biphone\s*11\s*pro\s*max\b", "iPhone 11 Pro Max"),
-        (r"\biphone\s*11\s*pro\b", "iPhone 11 Pro"),
-        (r"\biphone\s*11\b", "iPhone 11"),
-        (r"\biphone\s*xs\s*max\b", "iPhone XS Max"),
-        (r"\biphone\s*xs\b", "iPhone XS"),
-        (r"\biphone\s*xr\b", "iPhone XR"),
-        (r"\biphone\s*x\b", "iPhone X"),
-        (r"\biphone\s*se(?:\s*2022|\s*3(?:a|ª)?\s*gen(?:erazione)?)\b", "iPhone SE 2022"),
-        (r"\biphone\s*se(?:\s*2020|\s*2(?:a|ª)?\s*gen(?:erazione)?)\b", "iPhone SE 2020"),
-        (r"\biphone\s*8\s*plus\b", "iPhone 8 Plus"),
-        (r"\biphone\s*8\b", "iPhone 8"),
-    ]
+    # Sicurezza: modelli iPhone nuovi/non presenti nel catalogo non devono
+    # essere ricondotti per somiglianza a modelli precedenti.
+    mentions_iphone_17 = bool(
+        re.search(r"\biphone\s*17\b|\biphone\s*17\s*(air|pro|max|pro\s*max)\b", normalized)
+    )
+    mentions_iphone_air = bool(re.search(r"\biphone\s*(17\s*)?air\b", normalized))
 
-    for pattern, model in iphone_rules:
-        if re.search(pattern, lowered, flags=re.IGNORECASE):
-            storage_match = re.search(
-                r"(?<!\d)(64|128|256|512|1024)\s*(?:gb|giga)\b",
-                lowered,
-                flags=re.IGNORECASE,
-            )
-            storage = f"{storage_match.group(1)}GB" if storage_match else ""
-            variant = f" {storage}" if storage else ""
-            return {
-                "brand": "apple",
-                "model": f"{model}{variant}",
-                "product_key": f"apple:{model}:{storage or 'memoria-non-specificata'}".lower(),
-            }
+    if mentions_iphone_17 and "17" not in detected_model and ":17" not in product_key:
+        return {
+            "brand": "",
+            "model": "",
+            "variant": "",
+            "storage": "",
+            "recognition_confidence": 0,
+            "product_key": "unidentified",
+        }
 
-    rules: List[Tuple[str, str, str]] = [
-        ("engwe", r"\bep[-\s]?2\s*pro\b", "EP-2 Pro"),
-        ("engwe", r"\bengine\s*pro\b", "Engine Pro"),
-        ("engwe", r"\bl20\b", "L20"),
-        ("ado", r"\ba20f\b", "A20F"),
-        ("dyson", r"\bv15\b", "V15"),
-        ("dyson", r"\bv12\b", "V12"),
-        ("dyson", r"\bv11\b", "V11"),
-        ("dyson", r"\bv10\b", "V10"),
-        ("dyson", r"\bv8\b", "V8"),
-        ("sony", r"\bps5\b|\bplaystation\s*5\b", "PlayStation 5"),
-        ("nintendo", r"\bswitch\s*oled\b", "Switch OLED"),
-    ]
+    if mentions_iphone_air and "air" not in detected_model and ":air" not in product_key:
+        return {
+            "brand": "",
+            "model": "",
+            "variant": "",
+            "storage": "",
+            "recognition_confidence": 0,
+            "product_key": "unidentified",
+        }
 
-    for brand, pattern, model in rules:
-        if re.search(pattern, lowered, flags=re.IGNORECASE):
-            return {
-                "brand": brand,
-                "model": model,
-                "product_key": f"{brand}:{model}".lower(),
-            }
-
-    for keyword in KEYWORDS:
-        if keyword in lowered:
-            return {
-                "brand": keyword,
-                "model": "",
-                "product_key": keyword,
-            }
-
-    return {"brand": "", "model": "", "product_key": ""}
-
+    return result
 
 def is_probable_listing_url(url: str) -> bool:
     parsed = urlparse(url)
@@ -521,8 +494,14 @@ def add_item(
         "matched": matched,
         "brand": product["brand"],
         "model": product["model"],
+        "variant": product.get("variant", ""),
+        "storage": product.get("storage", ""),
+        "recognition_confidence": product.get("recognition_confidence", 0),
         "product_key": product["product_key"],
+        "source": "subito",
+        "category": source_label(source_url).lower(),
         "source_url": source_url,
+        "relevant": bool(matched),
     }
 
     current = items.get(item_id)
@@ -698,8 +677,18 @@ async def extract_items(url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
             1 for item in relevant_items
             if item.get("price") is not None
         )
+        diagnostics["archivable"] = sum(
+            1 for item in all_listings
+            if item.get("id") and item.get("url")
+        )
+        diagnostics["archivable_priced"] = sum(
+            1 for item in all_listings
+            if item.get("price") is not None
+        )
 
-        return relevant_items, diagnostics
+        # Il collector riceve tutti gli annunci validi della categoria.
+        # La selezione per parole chiave avviene dopo il salvataggio SQLite.
+        return all_listings, diagnostics
 
     except Exception as exc:
         diagnostics["error"] = str(exc)
@@ -1004,126 +993,281 @@ def market_confidence(
     return score, label
 
 
-def estimate_market_values(
-    items: List[Dict[str, Any]],
-    history: List[Dict[str, Any]],
-) -> None:
-    """
-    Motore di valutazione v1.3.
+def listing_condition_bucket(text: str) -> str:
+    lowered = normalize_text(text).lower()
 
-    Per ogni prodotto:
-    - considera un solo prezzo per annuncio;
-    - usa soltanto dati entro MARKET_LOOKBACK_DAYS;
-    - esclude l'annuncio che sta valutando;
-    - rimuove gli outlier;
-    - stima valore centrale e fascia prudenziale;
-    - assegna un punteggio di attendibilità.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        days=MARKET_LOOKBACK_DAYS
+    damaged_terms = (
+        "non funzionante", "non funziona", "da riparare", "da sistemare",
+        "per ricambi", "rotto", "guasto", "non testato", "bloccato",
+    )
+    incomplete_terms = (
+        "solo corpo", "solo console", "senza caricatore",
+        "senza batteria", "senza accessori", "incompleto",
+    )
+    premium_terms = (
+        "nuovo", "mai usato", "sigillato", "pari al nuovo",
     )
 
-    rows_by_product: Dict[str, List[Dict[str, Any]]] = {}
+    if any(term in lowered for term in damaged_terms):
+        return "damaged"
+    if any(term in lowered for term in incomplete_terms):
+        return "incomplete"
+    if any(term in lowered for term in premium_terms):
+        return "premium"
+    return "standard"
 
-    for row in history:
-        if not isinstance(row, dict):
-            continue
 
-        key = str(row.get("product_key") or "").strip().lower()
-        price = row.get("price")
-        last_seen = parse_iso_datetime(
-            row.get("last_seen") or row.get("first_seen")
+def is_precise_product_key(key: str) -> bool:
+    normalized = normalize_text(key).lower()
+    return bool(normalized and ":" in normalized)
+
+
+def comparable_rows_for_item(
+    item: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    candidate_text = (
+        f"{item.get('title', '')} "
+        f"{item.get('text', item.get('description', ''))}"
+    )
+    candidate_bucket = listing_condition_bucket(candidate_text)
+
+    filtered: List[Dict[str, Any]] = []
+
+    for row in rows:
+        row_text = (
+            f"{row.get('title', '')} "
+            f"{row.get('text', row.get('description', ''))}"
         )
+        row_bucket = listing_condition_bucket(row_text)
 
-        if (
-            not key
-            or not isinstance(price, (int, float))
-            or float(price) <= 0
-            or last_seen is None
-            or last_seen < cutoff
-        ):
-            continue
+        if candidate_bucket == "damaged":
+            if row_bucket != "damaged":
+                continue
+        elif candidate_bucket == "incomplete":
+            if row_bucket not in {"incomplete", "damaged"}:
+                continue
+        elif candidate_bucket == "premium":
+            # "Come nuovo", "pari al nuovo" e "nuovo" non devono azzerare
+            # il campione. Accettiamo premium e standard, ma mai rotti/incompleti.
+            if row_bucket in {"damaged", "incomplete"}:
+                continue
+        else:
+            if row_bucket in {"damaged", "incomplete"}:
+                continue
 
-        rows_by_product.setdefault(key, []).append({
-            "id": str(row.get("id") or ""),
-            "price": float(price),
-            "last_seen": last_seen,
-        })
+        filtered.append(row)
 
+    return filtered
+
+def comparable_quality_score(
+    item: Dict[str, Any],
+    row: Dict[str, Any],
+) -> int:
+    """Assegna un punteggio 0-100 alla qualità del comparabile.
+
+    Il product_key è già uguale perché la query DB lo impone. Il punteggio
+    premia condizioni simili e parole rilevanti condivise, senza pretendere
+    informazioni che spesso gli annunci non contengono.
+    """
+    score = 60
+
+    item_text = normalize_text(
+        f"{item.get('title', '')} {item.get('text', '')}"
+    ).lower()
+    row_text = normalize_text(
+        f"{row.get('title', '')} "
+        f"{row.get('text', row.get('description', ''))}"
+    ).lower()
+
+    if listing_condition_bucket(item_text) == listing_condition_bucket(row_text):
+        score += 20
+
+    item_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", item_text)
+        if len(token) >= 3
+    }
+    row_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", row_text)
+        if len(token) >= 3
+    }
+
+    shared = item_tokens.intersection(row_tokens)
+    score += min(len(shared) * 2, 20)
+
+    return min(score, 100)
+
+
+def weighted_median(
+    values_and_weights: List[Tuple[float, float]],
+) -> float:
+    """Mediana pesata senza dipendenze esterne."""
+    if not values_and_weights:
+        raise ValueError("Campione pesato vuoto")
+
+    ordered = sorted(values_and_weights, key=lambda pair: pair[0])
+    total_weight = sum(max(weight, 0.0) for _, weight in ordered)
+
+    if total_weight <= 0:
+        return float(median([value for value, _ in ordered]))
+
+    threshold = total_weight / 2
+    cumulative = 0.0
+
+    for value, weight in ordered:
+        cumulative += max(weight, 0.0)
+        if cumulative >= threshold:
+            return float(value)
+
+    return float(ordered[-1][0])
+
+
+def filter_by_central_deviation(
+    prices: List[float],
+) -> List[float]:
+    """Secondo filtro prudenziale attorno alla mediana.
+
+    Serve soprattutto con campioni piccoli nei quali l'IQR può non eliminare
+    un annuncio chiaramente distante dal resto del mercato.
+    """
+    if len(prices) < 4:
+        return prices
+
+    center = float(median(prices))
+    if center <= 0:
+        return prices
+
+    max_deviation = MAX_COMPARABLE_DEVIATION_PERCENT / 100
+    filtered = [
+        price for price in prices
+        if abs(price - center) / center <= max_deviation
+    ]
+
+    return filtered if len(filtered) >= MIN_COMPARABLES else prices
+
+def estimate_market_values(items: List[Dict[str, Any]]) -> None:
+    """Price Engine Pro v1.8.
+
+    Usa soltanto comparabili attivi, con product_key preciso e condizione
+    omogenea. Applica due filtri anti-anomalia e una mediana pesata.
+    Restituisce anche una fascia di mercato e dettagli su esclusioni e qualità.
+    """
     for item in items:
         asking_price = item.get("price")
         key = str(item.get("product_key") or "").strip().lower()
         item_id = str(item.get("id") or "")
 
-        raw_rows = [
-            row for row in rows_by_product.get(key, [])
-            if row["id"] != item_id
-        ]
-        raw_prices = [row["price"] for row in raw_rows]
-        comparable_prices = remove_price_outliers(raw_prices)
+        comparable_rows = DB.active_comparables(
+            key,
+            exclude_listing_id=item_id,
+            max_age_days=MARKET_LOOKBACK_DAYS,
+        ) if is_precise_product_key(key) else []
+
+        rows_before_condition_filter = len(comparable_rows)
+        comparable_rows = comparable_rows_for_item(item, comparable_rows)
+        condition_excluded = max(
+            0,
+            rows_before_condition_filter - len(comparable_rows),
+        )
+
+        priced_rows: List[Tuple[Dict[str, Any], float]] = []
+        for row in comparable_rows:
+            price = row.get("price")
+            if isinstance(price, (int, float)) and float(price) > 0:
+                priced_rows.append((row, float(price)))
+
+        raw_prices = [price for _, price in priced_rows]
+        iqr_prices = remove_price_outliers(raw_prices)
+        comparable_prices = filter_by_central_deviation(iqr_prices)
+
+        allowed_prices = set(comparable_prices)
+        weighted_prices: List[Tuple[float, float]] = []
+
+        for row, price in priced_rows:
+            if price not in allowed_prices:
+                continue
+            quality = comparable_quality_score(item, row)
+            weighted_prices.append((price, max(quality, 1)))
 
         newest_seen = max(
-            (row["last_seen"] for row in raw_rows),
+            (
+                parse_iso_datetime(row.get("last_seen_at"))
+                for row, price in priced_rows
+                if price in allowed_prices
+            ),
             default=None,
         )
+
         confidence_score, confidence_label = market_confidence(
             comparable_prices,
             newest_seen,
         )
 
-        item["raw_comparables"] = len(raw_prices)
-        item["comparables"] = len(comparable_prices)
-        item["outliers_removed"] = max(
-            0,
-            len(raw_prices) - len(comparable_prices),
+        outliers_removed = max(0, len(raw_prices) - len(comparable_prices))
+        average_quality = (
+            round(
+                sum(weight for _, weight in weighted_prices)
+                / len(weighted_prices),
+                1,
+            )
+            if weighted_prices else 0.0
         )
+
+        item["raw_comparables"] = rows_before_condition_filter
+        item["priced_comparables"] = len(raw_prices)
+        item["comparables"] = len(comparable_prices)
+        item["condition_excluded"] = condition_excluded
+        item["outliers_removed"] = outliers_removed
+        item["average_comparable_quality"] = average_quality
         item["confidence_score"] = confidence_score
         item["confidence_label"] = confidence_label
         item["market_lookback_days"] = MARKET_LOOKBACK_DAYS
 
         if comparable_prices:
-            item["market_low"] = round(
-                percentile(comparable_prices, 0.25),
-                2,
-            )
-            item["market_high"] = round(
-                percentile(comparable_prices, 0.75),
-                2,
-            )
+            market_min = min(comparable_prices)
+            market_low = percentile(comparable_prices, 0.25)
+            market_high = percentile(comparable_prices, 0.75)
+
+            item["market_min"] = round(market_min, 2)
+            item["market_low"] = round(market_low, 2)
+            item["market_high"] = round(market_high, 2)
         else:
+            item["market_min"] = None
             item["market_low"] = None
             item["market_high"] = None
 
         if (
             asking_price is None
-            or not key
+            or not is_precise_product_key(key)
             or len(comparable_prices) < MIN_COMPARABLES
             or confidence_score < MIN_CONFIDENCE_SCORE
+            or not weighted_prices
         ):
             item["market_value"] = None
             item["quick_sale_value"] = None
             item["estimated_costs"] = None
             item["estimated_margin"] = None
+            item["maximum_buy_price"] = None
             item["roi"] = None
+            item["discount_vs_market_low"] = None
             continue
 
-        market_value = float(median(comparable_prices))
+        market_value = weighted_median(weighted_prices)
 
-        # Vendita rapida prudenziale: usiamo il valore più basso tra
-        # il 25° percentile e il 90% della mediana.
+        # Rivendita prudente: il più basso tra il 20° percentile e il 90%
+        # della mediana pesata. Non usa mai il minimo assoluto come riferimento.
         quick_sale_value = min(
-            percentile(comparable_prices, 0.25),
+            percentile(comparable_prices, 0.20),
             market_value * 0.90,
         )
 
-        estimated_costs = max(
-            25.0,
-            float(asking_price) * 0.06,
+        estimated_costs = max(25.0, float(asking_price) * 0.06)
+        maximum_buy_price = max(
+            0.0,
+            quick_sale_value - estimated_costs - MIN_MARGIN_EURO,
         )
         estimated_margin = (
-            quick_sale_value
-            - float(asking_price)
-            - estimated_costs
+            quick_sale_value - float(asking_price) - estimated_costs
         )
         roi = (
             estimated_margin / float(asking_price) * 100
@@ -1131,12 +1275,23 @@ def estimate_market_values(
             else 0
         )
 
+        market_low = float(item["market_low"])
+        discount_vs_market_low = (
+            (market_low - float(asking_price)) / market_low * 100
+            if market_low > 0
+            else 0
+        )
+
         item["market_value"] = round(market_value, 2)
         item["quick_sale_value"] = round(quick_sale_value, 2)
         item["estimated_costs"] = round(estimated_costs, 2)
+        item["maximum_buy_price"] = round(maximum_buy_price, 2)
         item["estimated_margin"] = round(estimated_margin, 2)
         item["roi"] = round(roi, 1)
-
+        item["discount_vs_market_low"] = round(
+            discount_vs_market_low,
+            1,
+        )
 
 def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     """Trasforma i dati economici in una decisione spiegabile."""
@@ -1148,7 +1303,10 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     asking_price = item.get("price")
     costs = item.get("estimated_costs")
     confidence = int(item.get("confidence_score") or 0)
-    precise_model = bool(item.get("model")) and ":" in str(item.get("product_key") or "")
+    discount_vs_market_low = item.get("discount_vs_market_low")
+    precise_model = bool(item.get("model")) and is_precise_product_key(
+        str(item.get("product_key") or "")
+    )
 
     reasons: List[str] = []
     warnings: List[str] = []
@@ -1173,8 +1331,22 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
         score += max(0.0, min(discount_percent, 30.0))
         if discount_percent >= 20:
             reasons.append("prezzo almeno 20% sotto il valore mediano")
-        elif discount_percent >= 10:
-            reasons.append("prezzo sotto il valore mediano")
+        elif discount_percent >= MIN_MARKET_DISCOUNT_PERCENT:
+            reasons.append("prezzo realmente sotto il valore mediano")
+        else:
+            warnings.append(
+                f"prezzo troppo vicino al mercato: sconto {discount_percent:.1f}%"
+            )
+
+    if isinstance(discount_vs_market_low, (int, float)):
+        if discount_vs_market_low >= MIN_DISCOUNT_VS_LOW_PERCENT:
+            reasons.append(
+                f"prezzo {discount_vs_market_low:.1f}% sotto la fascia bassa"
+            )
+        else:
+            warnings.append(
+                "prezzo non abbastanza sotto la fascia bassa del mercato"
+            )
 
     if isinstance(roi, (int, float)):
         score += max(0.0, min(float(roi), 25.0))
@@ -1209,8 +1381,27 @@ def analyze_deal(item: Dict[str, Any]) -> Dict[str, Any]:
     elif margin is None or roi is None or confidence < MIN_CONFIDENCE_SCORE:
         decision = "DATI_INSUFFICIENTI"
         label = "DATI INSUFFICIENTI: NON COMPRARE ANCORA"
+    elif not precise_model:
+        decision = "DATI_INSUFFICIENTI"
+        label = "DATI INSUFFICIENTI: MODELLO O VARIANTE DA CONFERMARE"
+    elif discount_percent is None or discount_percent < MIN_MARKET_DISCOUNT_PERCENT:
+        decision = "SCARTA"
+        label = "SCARTA: PREZZO TROPPO VICINO AL MERCATO"
+    elif (
+        not isinstance(discount_vs_market_low, (int, float))
+        or float(discount_vs_market_low) < MIN_DISCOUNT_VS_LOW_PERCENT
+    ):
+        decision = "SCARTA"
+        label = "SCARTA: NON È SOTTO LA FASCIA BASSA DEL MERCATO"
+    elif (
+        isinstance(max_offer, (int, float))
+        and isinstance(asking_price, (int, float))
+        and float(asking_price) > float(max_offer)
+    ):
+        decision = "MONITORA"
+        label = "MONITORA: COMPRA SOLO DOPO UNA TRATTATIVA"
     elif float(margin) >= MIN_MARGIN_EURO and float(roi) >= MIN_ROI_PERCENT:
-        if precise_model and risk["level"] == "BASSO":
+        if risk["level"] == "BASSO":
             decision = "COMPRA"
             label = "COMPRA: CONTATTA E VERIFICA SUBITO"
         else:
@@ -1283,7 +1474,8 @@ def build_message(item: Dict[str, Any]) -> str:
         f"<b>{title}</b>\n"
         f"🧩 Prodotto: <b>{html.escape(product_name)}</b>\n\n"
         f"💰 Prezzo richiesto: <b>{euro(item.get('price'))}</b>\n"
-        f"📊 Valore mediano stimato: <b>{euro(item.get('market_value'))}</b>\n"
+        f"📉 Fascia mercato: <b>{euro(item.get('market_low'))} – {euro(item.get('market_high'))}</b>\n"
+        f"📊 Valore centrale pesato: <b>{euro(item.get('market_value'))}</b>\n"
         f"⚡ Rivendita rapida prudente: <b>{euro(item.get('quick_sale_value'))}</b>\n"
         f"🏷 Sconto sul mercato: <b>{discount_text}</b>\n"
         f"🤝 Offerta massima prudente: <b>{euro(analysis.get('max_offer'))}</b>\n"
@@ -1292,8 +1484,11 @@ def build_message(item: Dict[str, Any]) -> str:
         f"📈 ROI stimato: <b>{item.get('roi', 'non disponibile')}%</b>\n"
         f"🛡 Attendibilità: <b>{item.get('confidence_label', 'INSUFFICIENTE')}</b> "
         f"({item.get('confidence_score', 0)}/100)\n"
-        f"📚 Confronti: <b>{item.get('comparables', 0)}</b> "
+        f"📚 Confronti validi: <b>{item.get('comparables', 0)}</b> "
         f"su {item.get('raw_comparables', 0)}\n"
+        f"🧹 Esclusi per condizione: <b>{item.get('condition_excluded', 0)}</b>\n"
+        f"🚫 Prezzi anomali esclusi: <b>{item.get('outliers_removed', 0)}</b>\n"
+        f"🎯 Qualità media comparabili: <b>{item.get('average_comparable_quality', 0)}/100</b>\n"
         f"⚠️ Rischio: <b>{risk['level']}</b> ({risk['score']}/100)\n\n"
         f"<b>PERCHÉ</b>\n{reasons}\n\n"
         f"<b>DA VERIFICARE</b>\n{warnings}\n\n"
@@ -1308,29 +1503,15 @@ def build_message(item: Dict[str, Any]) -> str:
 
 async def scan_once(application: Application) -> Dict[str, Any]:
     if SCAN_LOCK.locked():
-        return {
-            "busy": True,
-            "new": 0,
-            "valid": 0,
-            "diagnostics": [],
-        }
+        return {"busy": True, "new": 0, "valid": 0, "diagnostics": []}
 
     async with SCAN_LOCK:
         if not SOURCE_URLS:
             log.warning("Nessuna SOURCE_URL configurata.")
-            return {
-                "busy": False,
-                "new": 0,
-                "valid": 0,
-                "diagnostics": [],
-            }
+            return {"busy": False, "new": 0, "valid": 0, "diagnostics": []}
 
-        state = load_json(STATE_FILE, {"observed": [], "notified": []})
-        observed = set(state.get("observed", []))
-        notified = set(state.get("notified", []))
-
+        scan_token = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         all_extracted: List[Dict[str, Any]] = []
-        new_items: List[Dict[str, Any]] = []
         diagnostics: List[Dict[str, Any]] = []
 
         for source_url in SOURCE_URLS:
@@ -1338,36 +1519,105 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             diagnostics.append(source_diagnostics)
             all_extracted.extend(extracted_items)
 
-            for item in extracted_items:
-                if item["id"] not in observed:
-                    observed.add(item["id"])
+        # Deduplica eventuali annunci presenti in più fonti/categorie.
+        unique_items = {str(item["id"]): item for item in all_extracted}.values()
+        all_extracted = list(unique_items)
+
+        # Salviamo nel database ogni annuncio valido trovato nelle
+        # categorie configurate, anche quando non contiene una keyword.
+        # Solo gli annunci pertinenti vengono poi valutati economicamente.
+        new_archived_items: List[Dict[str, Any]] = []
+        relevant_items: List[Dict[str, Any]] = []
+        new_items: List[Dict[str, Any]] = []
+
+        for item in all_extracted:
+            is_new = DB.upsert_listing(item, scan_token=scan_token)
+            if is_new:
+                new_archived_items.append(item)
+            if item.get("matched"):
+                relevant_items.append(item)
+                if is_new:
                     new_items.append(item)
 
-        history = update_history(all_extracted)
+        all_sources_ok = bool(diagnostics) and all(not row.get("error") for row in diagnostics)
+        if all_sources_ok:
+            DB.mark_missing_after_scan(scan_token, source="subito", grace_hours=24)
+
         update_collection_stats(
             diagnostics=diagnostics,
-            relevant_items=all_extracted,
+            relevant_items=relevant_items,
             new_items_count=len(new_items),
         )
-        estimate_market_values(new_items, history)
+        estimate_market_values(relevant_items)
 
-        analyses = {item["id"]: analyze_deal(item) for item in new_items}
+        analyses: Dict[str, Dict[str, Any]] = {}
         decision_counts = {
-            "COMPRA": 0,
-            "TRATTA": 0,
-            "MONITORA": 0,
-            "SCARTA": 0,
-            "DATI_INSUFFICIENTI": 0,
+            "COMPRA": 0, "TRATTA": 0, "MONITORA": 0,
+            "SCARTA": 0, "DATI_INSUFFICIENTI": 0,
         }
-        for analysis in analyses.values():
-            decision = analysis["decision"]
-            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+
+        global LAST_DECISION_DEBUG
+        current_debug_rows: List[Dict[str, Any]] = []
+
+        for item in relevant_items:
+            analysis = analyze_deal(item)
+            analyses[item["id"]] = analysis
+
+            current_debug_rows.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "product_key": item.get("product_key"),
+                "brand": item.get("brand"),
+                "model": item.get("model"),
+                "storage": item.get("storage"),
+                "price": item.get("price"),
+                "market_low": item.get("market_low"),
+                "market_high": item.get("market_high"),
+                "market_value": item.get("market_value"),
+                "quick_sale_value": item.get("quick_sale_value"),
+                "estimated_margin": item.get("estimated_margin"),
+                "roi": item.get("roi"),
+                "comparables": item.get("comparables", 0),
+                "raw_comparables": item.get("raw_comparables", 0),
+                "priced_comparables": item.get("priced_comparables", 0),
+                "confidence_score": item.get("confidence_score", 0),
+                "confidence_label": item.get("confidence_label", "INSUFFICIENTE"),
+                "decision": analysis.get("decision"),
+                "label": analysis.get("label"),
+                "radar_score": analysis.get("radar_score"),
+                "max_offer": analysis.get("max_offer"),
+                "reasons": analysis.get("reasons", []),
+                "warnings": analysis.get("warnings", []),
+            })
+            item["decision"] = analysis["decision"]
+            item["rejection_reason"] = "; ".join(analysis.get("warnings", []))
+            decision_counts[analysis["decision"]] = decision_counts.get(analysis["decision"], 0) + 1
+            DB.record_evaluation(
+                item["id"],
+                {
+                    "asking_price": item.get("price"),
+                    "estimated_sale_price": item.get("quick_sale_value"),
+                    "maximum_buy_price": item.get("maximum_buy_price") or analysis.get("max_offer"),
+                    "gross_margin": item.get("estimated_margin"),
+                    "net_margin": item.get("estimated_margin"),
+                    "roi": item.get("roi"),
+                    "comparables_count": item.get("comparables", 0),
+                    "confidence": item.get("confidence_score", 0),
+                    "decision": analysis["decision"],
+                    "rejection_reason": item["rejection_reason"],
+                },
+            )
+
+        LAST_DECISION_DEBUG = (
+            current_debug_rows + LAST_DECISION_DEBUG
+        )[:MAX_DECISION_DEBUG_ITEMS]
 
         valid_deals = [
-            item for item in new_items
-            if item["id"] not in notified and is_valid_deal(item)
+            item for item in relevant_items
+            if not DB.was_notified(item["id"])
+            and analyses[item["id"]]["decision"] in {"COMPRA", "TRATTA"}
         ]
-
         valid_deals.sort(
             key=lambda item: (
                 opportunity_score(item),
@@ -1380,40 +1630,29 @@ async def scan_once(application: Application) -> Dict[str, Any]:
         for item in valid_deals[:MAX_ALERTS_PER_SCAN]:
             message = build_message(item)
             sent_to_at_least_one = False
-
             for chat_id in subscribers():
                 try:
                     await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode="HTML",
+                        chat_id=chat_id, text=message, parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
                     sent_to_at_least_one = True
                 except Exception as exc:
                     log.warning("Invio fallito verso %s: %s", chat_id, exc)
-
             if sent_to_at_least_one:
-                notified.add(item["id"])
-
-        save_json(
-            STATE_FILE,
-            {
-                "observed": list(observed)[-10000:],
-                "notified": list(notified)[-5000:],
-            },
-        )
+                DB.mark_notified(item["id"], item.get("decision", "AFFARE"))
 
         log.info(
-            "SCAN nuovi=%s affari_validi=%s iscritti=%s",
-            len(new_items),
-            len(valid_deals),
-            len(subscribers()),
+            "SCAN pertinenti=%s nuovi=%s affari_validi=%s iscritti=%s db=%s",
+            len(relevant_items), len(new_items), len(valid_deals),
+            len(subscribers()), DB.location_label,
         )
-
         return {
             "busy": False,
             "new": len(new_items),
+            "archived": len(all_extracted),
+            "new_archived": len(new_archived_items),
+            "relevant": len(relevant_items),
             "valid": len(valid_deals),
             "buy": decision_counts.get("COMPRA", 0),
             "negotiate": decision_counts.get("TRATTA", 0),
@@ -1422,6 +1661,117 @@ async def scan_once(application: Application) -> Dict[str, Any]:
             "insufficient": decision_counts.get("DATI_INSUFFICIENTI", 0),
             "diagnostics": diagnostics,
         }
+
+
+
+def reclassify_database_listings() -> Dict[str, int]:
+    """Ricalcola la classificazione degli annunci già presenti."""
+    counters = {
+        "total": 0,
+        "changed": 0,
+        "recognized": 0,
+        "unrecognized": 0,
+    }
+    placeholder = "%s" if DB.backend == "postgresql" else "?"
+
+    with DB.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, description, brand, model, product_key
+            FROM listings
+            ORDER BY id
+            """
+        ).fetchall()
+
+        for row in rows:
+            counters["total"] += 1
+            product = identify_product(
+                f"{row['title'] or ''} {row['description'] or ''}"
+            )
+
+            new_brand = str(product.get("brand") or "")
+            new_model = str(product.get("model") or "")
+            new_variant = str(product.get("variant") or "")
+            new_storage = str(product.get("storage") or "")
+            new_key = str(product.get("product_key") or "").lower()
+            confidence = int(product.get("recognition_confidence") or 0)
+
+            if new_key:
+                counters["recognized"] += 1
+            else:
+                counters["unrecognized"] += 1
+
+            old_key = str(row["product_key"] or "").lower()
+            old_brand = str(row["brand"] or "")
+            old_model = str(row["model"] or "")
+
+            if (
+                new_key == old_key
+                and new_brand == old_brand
+                and new_model == old_model
+            ):
+                continue
+
+            conn.execute(
+                f"""
+                UPDATE listings
+                SET brand = {placeholder},
+                    model = {placeholder},
+                    variant = {placeholder},
+                    storage = {placeholder},
+                    product_key = {placeholder},
+                    recognition_confidence = {placeholder},
+                    updated_at = {placeholder}
+                WHERE id = {placeholder}
+                """,
+                (
+                    new_brand,
+                    new_model,
+                    new_variant,
+                    new_storage,
+                    new_key,
+                    confidence,
+                    datetime.now(timezone.utc).isoformat(),
+                    str(row["id"]),
+                ),
+            )
+            counters["changed"] += 1
+
+    return counters
+
+
+async def reclassify(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    await update.message.reply_text("🧠 Riclassificazione v2 in corso…")
+
+    try:
+        result = reclassify_database_listings()
+    except Exception as exc:
+        log.exception("Riclassificazione v2 fallita")
+        await update.message.reply_text(
+            f"❌ Riclassificazione fallita:\n{str(exc)[:500]}"
+        )
+        return
+
+    percentage = (
+        result["recognized"] / result["total"] * 100
+        if result["total"] else 0
+    )
+
+    await update.message.reply_text(
+        "✅ RICLASSIFICAZIONE V2 COMPLETATA\n\n"
+        f"Annunci analizzati: {result['total']}\n"
+        f"Annunci modificati: {result['changed']}\n"
+        f"Riconosciuti con chiave precisa: {result['recognized']}\n"
+        f"Non identificati: {result['unrecognized']}\n"
+        f"Tasso riconoscimento: {percentage:.1f}%\n\n"
+        "Ora esegui /collector."
+    )
 
 
 # ============================================================
@@ -1435,7 +1785,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v3.1 Vision + Knowledge attivato.\n\n"
+        "✅ Radar Affari Decision Engine v3.1 PostgreSQL + Vision + Knowledge attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1447,6 +1797,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/debug - mostra cosa legge il parser\n"
         "/test - prova Telegram\n"
         "/scan - scansione manuale\n"
+        "/reclassify - riclassifica tutto lo storico\n"
+        "/decisiondebug - dettaglio ultime valutazioni\n"
+        "/topscarti - migliori scarti e quasi affari\n"
+        "/topcompra - migliori compra e tratta\n"
+        "/visiontest URL - analisi foto di un annuncio\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1456,35 +1811,29 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    history = load_json(HISTORY_FILE, [])
-    state = load_json(STATE_FILE, {"observed": [], "notified": []})
+    db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
-
-    identified_models = {
-        str(row.get("product_key"))
-        for row in history
-        if isinstance(row, dict)
-        and row.get("product_key")
-        and ":" in str(row.get("product_key"))
-    }
-
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v3.1 Vision + Knowledge\n"
+        f"🧠 Versione: Decision Engine v3.1 PostgreSQL + Vision + Knowledge\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
         f"💵 Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"📈 ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"🛡 Attendibilità minima: {MIN_CONFIDENCE_SCORE}/100\n"
-        f"📅 Storico utilizzato: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
+        f"📅 Confronti attivi: ultimi {MARKET_LOOKBACK_DAYS} giorni\n"
         f"📚 Confronti minimi per stima: {MIN_COMPARABLES}\n"
-        f"📚 Annunci nel Collector: {len(history)}\n"
-        f"🧩 Modelli identificati: {len(identified_models)}\n"
+        f"📉 Sconto minimo sul mercato: {MIN_MARKET_DISCOUNT_PERCENT:.0f}%\n"
+        f"📉 Sconto minimo sulla fascia bassa: {MIN_DISCOUNT_VS_LOW_PERCENT:.0f}%\n"
+        f"🗄 Annunci nel database: {db_stats['total']}\n"
+        f"✅ Annunci attivi: {db_stats['active']}\n"
+        f"⚠️ Annunci scomparsi: {db_stats['missing']}\n"
+        f"🧩 Annunci riconosciuti: {db_stats['recognized']}\n"
+        f"💶 Osservazioni prezzo: {db_stats['price_observations']}\n"
+        f"🧮 Valutazioni salvate: {db_stats['evaluations']}\n"
         f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
-        f"👁 Annunci osservati: {len(state.get('observed', []))}\n"
-        f"🔔 Annunci notificati: {len(state.get('notified', []))}\n"
         f"👥 Iscritti: {len(subscribers())}\n"
-        f"💾 Cartella dati: {DATA_DIR}"
+        f"💾 Database: {DB.location_label}"
     )
 
 
@@ -1513,7 +1862,10 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "✅ CONTROLLO TERMINATO\n\n"
-        f"Nuovi annunci: {result['new']}\n"
+        f"Annunci letti e archiviati: {result.get('archived', 0)}\n"
+        f"Nuovi nel database: {result.get('new_archived', 0)}\n"
+        f"Annunci pertinenti: {result.get('relevant', 0)}\n"
+        f"Nuovi pertinenti: {result['new']}\n"
         f"🟢 Compra: {result.get('buy', 0)}\n"
         f"🟡 Tratta e verifica: {result.get('negotiate', 0)}\n"
         f"👀 Monitora: {result.get('monitor', 0)}\n"
@@ -1549,6 +1901,8 @@ async def fonti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"HTTP {diagnostics['status']}\n"
                 f"Link totali: {diagnostics['links']}\n"
                 f"URL annunci riconosciuti: {diagnostics['listing_urls']}\n"
+                f"Archiviabili: {diagnostics.get('archivable', 0)}\n"
+                f"Archiviabili con prezzo: {diagnostics.get('archivable_priced', 0)}\n"
                 f"Annunci pertinenti: {diagnostics['extracted']}\n"
                 f"Pertinenti con prezzo: {diagnostics['priced']}"
             )
@@ -1662,40 +2016,159 @@ async def collector(
     if update.message is None:
         return
 
-    history = load_json(HISTORY_FILE, [])
+    db_stats = DB.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
-
-    by_product: Dict[str, int] = {}
-    price_changes = 0
-
-    for row in history:
-        if not isinstance(row, dict):
-            continue
-
-        key = str(row.get("product_key") or "non identificato")
-        by_product[key] = by_product.get(key, 0) + 1
-
-        if len(row.get("price_history", [])) > 1:
-            price_changes += 1
-
-    top_products = sorted(
-        by_product.items(),
-        key=lambda pair: pair[1],
-        reverse=True,
-    )[:8]
-
+    top_products = DB.product_counts(8)
     top_text = "\n".join(
-        f"• {name}: {count}"
-        for name, count in top_products
+        f"• {row['product_key']}: {row['count']}" for row in top_products
     ) or "• nessun dato"
 
     await update.message.reply_text(
-        "🗄 STATO COLLECTOR\n\n"
-        f"Annunci archiviati: {len(history)}\n"
-        f"Scansioni registrate: {int(stats.get('scans', 0))}\n"
-        f"Annunci con variazioni prezzo: {price_changes}\n\n"
+        "🗄 STATO COLLECTOR POSTGRESQL\n\n"
+        f"Annunci archiviati: {db_stats['total']}\n"
+        f"Annunci attivi: {db_stats['active']}\n"
+        f"Annunci scomparsi: {db_stats['missing']}\n"
+        f"Osservazioni prezzo: {db_stats['price_observations']}\n"
+        f"Annunci con variazioni prezzo: {DB.price_change_listings_count()}\n"
+        f"Valutazioni registrate: {db_stats['evaluations']}\n"
+        f"Scansioni registrate: {int(stats.get('scans', 0))}\n\n"
         f"Prodotti più raccolti:\n{top_text}"
     )
+
+
+def _decision_debug_block(row: Dict[str, Any], index: int) -> str:
+    title = normalize_text(str(row.get("title") or ""))[:180]
+    url = str(row.get("url") or "")
+    product_key = str(row.get("product_key") or "non identificato")
+    decision = str(row.get("decision") or "DATI_INSUFFICIENTI")
+    label = str(row.get("label") or "")
+    reasons = row.get("reasons") or []
+    warnings = row.get("warnings") or []
+
+    reasons_text = (
+        "\n".join(f"✅ {reason}" for reason in reasons)
+        if reasons else "• nessun motivo positivo sufficiente"
+    )
+    warnings_text = (
+        "\n".join(f"⚠️ {warning}" for warning in warnings)
+        if warnings else "• nessun avviso specifico"
+    )
+
+    return (
+        f"#{index} {decision}\n"
+        f"{title}\n"
+        f"Prodotto: {product_key}\n"
+        f"Prezzo: {euro(row.get('price'))}\n"
+        f"Mercato: {euro(row.get('market_low'))} – {euro(row.get('market_high'))}\n"
+        f"Valore: {euro(row.get('market_value'))}\n"
+        f"Rivendita prudente: {euro(row.get('quick_sale_value'))}\n"
+        f"Margine: {euro(row.get('estimated_margin'))}\n"
+        f"ROI: {row.get('roi') if row.get('roi') is not None else 'n/d'}%\n"
+        f"Comparabili validi: {row.get('comparables', 0)}\n"
+        f"Con prezzo dopo filtro condizione: "
+        f"{row.get('priced_comparables', 0)}\n"
+        f"Candidati DB prima dei filtri: "
+        f"{row.get('raw_comparables', 0)}\n"
+        f"Attendibilità: {row.get('confidence_label', 'INSUFFICIENTE')} "
+        f"({row.get('confidence_score', 0)}/100)\n"
+        f"Radar score: {row.get('radar_score', 0)}/100\n"
+        f"Offerta massima: {euro(row.get('max_offer'))}\n"
+        f"Verdetto: {label}\n\n"
+        f"PERCHÉ\n{reasons_text}\n\n"
+        f"PROBLEMI\n{warnings_text}\n"
+        f"Link: {url}"
+    )
+
+
+async def _send_debug_rows(
+    update: Update,
+    rows: List[Dict[str, Any]],
+    heading: str,
+    limit: int = 10,
+) -> None:
+    if update.message is None:
+        return
+
+    if not rows:
+        await update.message.reply_text(
+            "⚠️ Nessuna valutazione disponibile.\n"
+            "Esegui prima /scan."
+        )
+        return
+
+    await update.message.reply_text(
+        f"{heading}\n"
+        f"Mostro {min(len(rows), limit)} valutazioni."
+    )
+
+    for index, row in enumerate(rows[:limit], start=1):
+        block = _decision_debug_block(row, index)
+        for start_index in range(0, len(block), 3900):
+            await update.message.reply_text(
+                block[start_index:start_index + 3900],
+                disable_web_page_preview=True,
+            )
+
+
+async def decisiondebug(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    await _send_debug_rows(
+        update,
+        LAST_DECISION_DEBUG,
+        "🧪 DECISION DEBUG",
+        limit=10,
+    )
+
+
+async def topscarti(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    rows = [
+        row for row in LAST_DECISION_DEBUG
+        if row.get("decision") in {
+            "SCARTA", "MONITORA", "DATI_INSUFFICIENTI"
+        }
+    ]
+    rows.sort(
+        key=lambda row: (
+            float(row.get("radar_score") or 0),
+            float(row.get("estimated_margin") or 0),
+        ),
+        reverse=True,
+    )
+    await _send_debug_rows(
+        update,
+        rows,
+        "🔴 TOP SCARTI / QUASI AFFARI",
+        limit=10,
+    )
+
+
+async def topcompra(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    rows = [
+        row for row in LAST_DECISION_DEBUG
+        if row.get("decision") in {"COMPRA", "TRATTA"}
+    ]
+    rows.sort(
+        key=lambda row: (
+            float(row.get("radar_score") or 0),
+            float(row.get("estimated_margin") or 0),
+        ),
+        reverse=True,
+    )
+    await _send_debug_rows(
+        update,
+        rows,
+        "🟢 TOP COMPRA / TRATTA",
+        limit=10,
+    )
+
 
 
 def _vision_result_message(result: Dict[str, Any]) -> str:
@@ -1831,10 +2304,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    save_json(STATE_FILE, {"observed": [], "notified": []})
+    removed = DB.clear_notifications()
     await update.message.reply_text(
-        "♻️ Memoria annunci azzerata.\n"
-        "Lo storico prezzi è stato mantenuto."
+        f"♻️ Notifiche azzerate: {removed}.\n"
+        "Il database degli annunci e lo storico prezzi sono stati mantenuti."
     )
 
 
@@ -1888,12 +2361,16 @@ def main() -> None:
     application.add_handler(CommandHandler("categorie", categorie))
     application.add_handler(CommandHandler("collector", collector))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("reclassify", reclassify))
+    application.add_handler(CommandHandler("decisiondebug", decisiondebug))
+    application.add_handler(CommandHandler("topscarti", topscarti))
+    application.add_handler(CommandHandler("topcompra", topcompra))
     application.add_handler(CommandHandler("visiontest", visiontest))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v3.1 Vision + Knowledge: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v3.1 PostgreSQL + Vision + Knowledge: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
