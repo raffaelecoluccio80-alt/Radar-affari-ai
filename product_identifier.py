@@ -254,6 +254,28 @@ def _extract_storage(text: str, attributes: Dict[str, Any]) -> str:
     if compact_match:
         return f"{int(compact_match.group(1))}GB"
 
+    # Formati molto usati negli annunci, senza GB:
+    # iphone15pro128, iphone 11 pro 64, iphone14promax256.
+    iphone_compact = re.search(
+        r"iphone(?:se|xr|xs|x|\d{1,2})"
+        r"(?:promax|pro|plus|mini|e)?"
+        r"(64|128|256|512|1024)(?!\d)",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    if iphone_compact:
+        return f"{int(iphone_compact.group(1))}GB"
+
+    iphone_spaced = re.search(
+        r"\biphone\s*(?:se|xr|xs|x|\d{1,2})"
+        r"(?:\s*(?:pro\s*max|pro|max|plus|mini|e))?"
+        r"\s+(64|128|256|512|1024)(?!\s*(?:wh|v|mah))\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if iphone_spaced:
+        return f"{int(iphone_spaced.group(1))}GB"
+
     return ""
 
 
@@ -272,6 +294,8 @@ def _empty_result() -> Dict[str, Any]:
         "year": "",
         "product_key": "",
         "recognition_confidence": 0,
+        "excluded": False,
+        "exclusion_reason": "",
     }
 
 
@@ -302,6 +326,74 @@ def _family_can_match_without_brand(
     return model_score >= 110 and len(compact_text(model_name)) >= 5
 
 
+
+BIKE_ACCESSORY_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    (r"\bmanubri[oa]?\b|\bhandlebar\b", "manubrio"),
+    (r"\bsell[ae]\b|\bsaddle\b|\bphenom\b", "sella"),
+    (r"\bpedal[ei]\b", "pedali"),
+    (r"\bforcell[ae]\b|\bfork\b", "forcella"),
+    (r"\breggisella\b|\bseatpost\b", "reggisella"),
+    (r"\battacco\s*manubrio\b|\bstem\b", "attacco manubrio"),
+    (r"\bruot[ae]\b|\bwheelset\b|\bcerchi[oa]?\b", "ruote/cerchi"),
+    (r"\bcoperton[ei]\b|\bpneumatic[oi]\b|\btyres?\b", "copertoni"),
+    (r"\btelaio\b|\bframeset\b|\bframe\b", "telaio"),
+    (r"\bbatteria\b|\bbattery\b", "batteria"),
+    (r"\bmotore\b|\bmotor\b", "motore"),
+    (r"\bdisplay\b|\bcomputerino\b", "display"),
+    (r"\bcaricabatteri[ae]\b|\bcharger\b", "caricabatterie"),
+    (r"\bammortizzator[ei]\b|\bshock\b", "ammortizzatore"),
+    (r"\bfren[oi]\b|\bbrake\b", "freni"),
+    (r"\bcambio\b|\bderagliatore\b|\bderailleur\b", "trasmissione"),
+)
+
+COMPLETE_BIKE_TERMS: Tuple[str, ...] = (
+    "bici completa",
+    "bicicletta completa",
+    "mountain bike",
+    "mtb",
+    "e-bike",
+    "ebike",
+    "bici elettrica",
+    "vendo bici",
+    "vendo bicicletta",
+)
+
+
+def _bike_accessory_result(text: str) -> Optional[Dict[str, Any]]:
+    normalized = normalize_text(text)
+
+    # Un titolo chiaramente riferito a una bici completa non viene escluso
+    # soltanto perché la descrizione cita batteria, motore, forcella o freni.
+    has_complete_bike_signal = any(
+        term in normalized for term in COMPLETE_BIKE_TERMS
+    )
+
+    title_like = normalized[:220]
+    for pattern, label in BIKE_ACCESSORY_PATTERNS:
+        if not re.search(pattern, title_like, flags=re.IGNORECASE):
+            continue
+
+        # Sella, manubrio, pedali, ruote e reggisella sono segnali forti.
+        strong_accessory = label in {
+            "manubrio", "sella", "pedali", "reggisella",
+            "attacco manubrio", "ruote/cerchi", "copertoni",
+            "caricabatterie", "display",
+        }
+
+        if strong_accessory or not has_complete_bike_signal:
+            result = _empty_result()
+            result.update({
+                "family": "bike_accessory",
+                "model": label,
+                "excluded": True,
+                "exclusion_reason": f"accessorio bici rilevato: {label}",
+                "recognition_confidence": 99,
+            })
+            return result
+
+    return None
+
+
 def identify_product(text: str) -> Dict[str, Any]:
     """Identifica marca, famiglia, modello e memoria.
 
@@ -312,6 +404,10 @@ def identify_product(text: str) -> Dict[str, Any]:
     lowered = normalize_text(text)
     if not lowered:
         return _empty_result()
+
+    accessory_result = _bike_accessory_result(lowered)
+    if accessory_result is not None:
+        return accessory_result
 
     catalog = load_catalog()
     candidates: List[Dict[str, Any]] = []
@@ -446,4 +542,6 @@ def identify_product(text: str) -> Dict[str, Any]:
         "year": year,
         "product_key": product_key,
         "recognition_confidence": confidence,
+        "excluded": False,
+        "exclusion_reason": "",
     }
