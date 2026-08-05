@@ -19,7 +19,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from radar_database import RadarDatabase
 from product_identifier import identify_product as catalog_identify_product
-from visual_analyzer import analyze_listing
+from visual_analyzer import analyze_listing, fetch_listing_context
+from recognition_fusion import fuse_recognition, should_use_vision
+from vision_cache import VisionCache, build_vision_hash
 from knowledge_engine import build_knowledge_report
 
 
@@ -139,6 +141,7 @@ STATS_FILE = DATA_DIR / "radar_stats.json"
 DB_FILE = DATA_DIR / "radar_affari.sqlite3"
 DATABASE_TARGET = os.getenv("DATABASE_URL", "").strip() or str(DB_FILE)
 DB = RadarDatabase(DATABASE_TARGET)
+VISION_CACHE = VisionCache(DB)
 DB.migrate_json_files(
     history_file=HISTORY_FILE,
     state_file=STATE_FILE,
@@ -163,6 +166,9 @@ SCAN_LOCK = asyncio.Lock()
 
 LAST_DECISION_DEBUG: List[Dict[str, Any]] = []
 MAX_DECISION_DEBUG_ITEMS = 50
+
+VISION_UNKNOWNS_DEFAULT_LIMIT = max(1, min(int(os.getenv("VISION_UNKNOWNS_DEFAULT_LIMIT", "5")), 20))
+VISION_CACHE_MAX_AGE_DAYS = max(1, int(os.getenv("VISION_CACHE_MAX_AGE_DAYS", "30")))
 
 
 
@@ -1787,7 +1793,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v3.2 Recognition + PostgreSQL + Vision attivato.\n\n"
+        "✅ Radar Affari Decision Engine v4.0 Hybrid Vision Test attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1804,6 +1810,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/topscarti - migliori scarti e quasi affari\n"
         "/topcompra - migliori compra e tratta\n"
         "/visiontest URL - analisi foto di un annuncio\n"
+        "/visionunknowns [1-20] - prova Vision sugli sconosciuti\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1814,9 +1821,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     db_stats = DB.stats()
+    vision_stats = VISION_CACHE.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v3.2 Recognition + PostgreSQL + Vision\n"
+        f"🧠 Versione: Decision Engine v4.0 Hybrid Vision Test\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1834,6 +1842,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💶 Osservazioni prezzo: {db_stats['price_observations']}\n"
         f"🧮 Valutazioni salvate: {db_stats['evaluations']}\n"
         f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
+        f"👁 Vision cache: {vision_stats['success']} riuscite, {vision_stats['errors']} errori\n"
         f"👥 Iscritti: {len(subscribers())}\n"
         f"💾 Database: {DB.location_label}"
     )
@@ -2302,6 +2311,229 @@ async def visiontest(
             )
 
 
+
+
+def _vision_unknown_result_message(
+    index: int,
+    total: int,
+    item: Dict[str, Any],
+    fused: Dict[str, Any],
+    *,
+    cache_hit: bool,
+    database_updated: bool,
+) -> str:
+    conflicts = fused.get("conflicts") or []
+    conflict_text = (
+        "; ".join(
+            f"{row.get('field')}: testo={row.get('text_value')} / foto={row.get('vision_value')}"
+            for row in conflicts[:3]
+        )
+        if conflicts else "nessuno"
+    )
+
+    return (
+        f"👁 HYBRID VISION {index}/{total}\n\n"
+        f"Annuncio: {item.get('title') or '[senza titolo]'}\n"
+        f"Prezzo: {euro(item.get('price'))}\n\n"
+        f"PRIMA\n"
+        f"Prodotto: {item.get('product_key') or 'non identificato'}\n"
+        f"Confidence testo: {item.get('recognition_confidence', 0)}/100\n\n"
+        f"DOPO FUSIONE\n"
+        f"Marca: {fused.get('brand') or 'non determinata'}\n"
+        f"Modello: {fused.get('model') or 'non determinato'}\n"
+        f"Variante: {fused.get('variant') or 'non determinata'}\n"
+        f"Memoria/taglia: {fused.get('storage_or_size') or 'non determinata'}\n"
+        f"Product key: {fused.get('product_key') or 'unidentified'}\n"
+        f"Confidence finale: {fused.get('confidence', 0)}/100\n"
+        f"Stato: {fused.get('status')}\n"
+        f"Conflitti: {conflict_text}\n"
+        f"Cache: {'riutilizzata' if cache_hit else 'nuova analisi'}\n"
+        f"Database aggiornato: {'sì' if database_updated else 'no'}\n\n"
+        f"Link: {item.get('url') or ''}"
+    )
+
+
+async def _visionunknowns_worker(
+    application: Application,
+    chat_id: int,
+    limit: int,
+) -> None:
+    items = DB.unknown_listings(limit)
+    if not items:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text="✅ Nessun annuncio pertinente non identificato disponibile.",
+        )
+        return
+
+    recovered = 0
+    precise = 0
+    conflicts = 0
+    errors = 0
+    cache_hits = 0
+
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"👁 Test Vision ibrida avviato su {len(items)} annunci.\n"
+            "Riceverai un risultato per ogni annuncio."
+        ),
+    )
+
+    for index, item in enumerate(items, start=1):
+        try:
+            if not should_use_vision(item):
+                continue
+
+            listing = await fetch_listing_context(str(item["url"]))
+            vision_hash = build_vision_hash(
+                listing_url=listing["url"],
+                title=listing["title"],
+                description=listing["description"],
+                image_urls=listing["image_urls"],
+            )
+
+            cached = VISION_CACHE.get(
+                str(item["id"]),
+                expected_hash=vision_hash,
+                max_age_days=VISION_CACHE_MAX_AGE_DAYS,
+            )
+            cache_hit = cached is not None
+
+            if cached:
+                cache_hits += 1
+                vision_result = cached["vision_result"]
+                fused = cached.get("fused_result") or {}
+            else:
+                vision_result = await analyze_listing(
+                    str(item["url"]),
+                    listing_context=listing,
+                )
+                text_result = {
+                    "category": item.get("category"),
+                    "brand": item.get("brand"),
+                    "model": item.get("model"),
+                    "variant": item.get("variant"),
+                    "storage": item.get("storage"),
+                    "product_key": item.get("product_key"),
+                    "recognition_confidence": item.get(
+                        "recognition_confidence", 0
+                    ),
+                }
+                fused = fuse_recognition(text_result, vision_result)
+                VISION_CACHE.save_success(
+                    listing_id=str(item["id"]),
+                    vision_hash=vision_hash,
+                    vision_result=vision_result,
+                    fused_result=fused,
+                    model_used=str(
+                        vision_result.get("vision_model") or ""
+                    ),
+                )
+
+            database_updated = DB.update_listing_recognition(
+                str(item["id"]),
+                fused,
+            )
+
+            if fused.get("usable"):
+                recovered += 1
+            if fused.get("precise"):
+                precise += 1
+            if fused.get("status") == "conflict":
+                conflicts += 1
+
+            message = _vision_unknown_result_message(
+                index,
+                len(items),
+                item,
+                fused,
+                cache_hit=cache_hit,
+                database_updated=database_updated,
+            )
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=message[:4000],
+                disable_web_page_preview=True,
+            )
+
+        except Exception as exc:
+            errors += 1
+            log.exception(
+                "Vision ibrida fallita per listing %s",
+                item.get("id"),
+            )
+            try:
+                listing_url = str(item.get("url") or "")
+                fallback_hash = build_vision_hash(
+                    listing_url=listing_url,
+                    title=str(item.get("title") or ""),
+                    description=str(item.get("description") or ""),
+                    image_urls=[],
+                )
+                VISION_CACHE.save_error(
+                    listing_id=str(item.get("id") or ""),
+                    vision_hash=fallback_hash,
+                    error_message=str(exc),
+                    model_used=os.getenv("VISION_MODEL", ""),
+                )
+            except Exception:
+                log.exception("Salvataggio errore Vision cache fallito")
+
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ HYBRID VISION {index}/{len(items)}\n"
+                    f"{item.get('title') or '[senza titolo]'}\n"
+                    f"Errore: {str(exc)[:700]}"
+                ),
+            )
+
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ TEST VISION IBRIDA COMPLETATO\n\n"
+            f"Annunci esaminati: {len(items)}\n"
+            f"Recuperati utilizzabili: {recovered}\n"
+            f"Riconoscimenti precisi: {precise}\n"
+            f"Conflitti: {conflicts}\n"
+            f"Errori: {errors}\n"
+            f"Risultati da cache: {cache_hits}\n\n"
+            "Ora esegui /status e /scan per verificare l'impatto."
+        ),
+    )
+
+
+async def visionunknowns(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.effective_chat is None or update.message is None:
+        return
+
+    limit = VISION_UNKNOWNS_DEFAULT_LIMIT
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 20))
+        except ValueError:
+            await update.message.reply_text(
+                "Uso: /visionunknowns oppure /visionunknowns 10\n"
+                "Il limite massimo è 20."
+            )
+            return
+
+    await update.message.reply_text(
+        f"🚀 Avvio test in background su massimo {limit} annunci."
+    )
+    context.application.create_task(
+        _visionunknowns_worker(
+            context.application,
+            update.effective_chat.id,
+            limit,
+        )
+    )
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -2368,11 +2600,12 @@ def main() -> None:
     application.add_handler(CommandHandler("topscarti", topscarti))
     application.add_handler(CommandHandler("topcompra", topcompra))
     application.add_handler(CommandHandler("visiontest", visiontest))
+    application.add_handler(CommandHandler("visionunknowns", visionunknowns))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v3.2 Recognition + PostgreSQL + Vision: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v4.0 Hybrid Vision Test: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
@@ -2383,3 +2616,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
