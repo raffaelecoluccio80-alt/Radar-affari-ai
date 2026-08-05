@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 log = logging.getLogger("radar-affari.database")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now_iso() -> str:
@@ -520,6 +520,119 @@ class RadarDatabase:
             ).fetchall()
 
         return [dict(row) for row in rows]
+
+
+    def unknown_listings(
+        self,
+        limit: int = 20,
+        *,
+        active_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Restituisce annunci pertinenti ancora non identificati.
+
+        La pertinenza viene ricavata dal raw_json salvato dal collector.
+        Gli annunci senza URL o prezzo vengono esclusi.
+        """
+        placeholder = "%s" if self.backend == "postgresql" else "?"
+        status_sql = "AND status = 'active'" if active_only else ""
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, url, title, description, category, brand, model,
+                       variant, storage, product_key,
+                       recognition_confidence,
+                       current_price AS price, raw_json, last_seen_at
+                FROM listings
+                WHERE current_price IS NOT NULL
+                  AND url <> ''
+                  AND (
+                        product_key = ''
+                        OR product_key = 'unidentified'
+                        OR model = ''
+                      )
+                  {status_sql}
+                ORDER BY last_seen_at DESC
+                LIMIT {placeholder}
+                """,
+                (max(1, min(int(limit), 100)),),
+            ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                raw = json.loads(item.get("raw_json") or "{}")
+            except json.JSONDecodeError:
+                raw = {}
+
+            matched = raw.get("matched") or []
+            relevant = bool(raw.get("relevant")) or bool(matched)
+            excluded = bool(raw.get("excluded"))
+
+            if not relevant or excluded:
+                continue
+
+            item["matched"] = matched
+            item["relevant"] = relevant
+            item["excluded"] = excluded
+            results.append(item)
+
+        return results
+
+    def update_listing_recognition(
+        self,
+        listing_id: str,
+        fused_result: Dict[str, Any],
+    ) -> bool:
+        """Aggiorna l'identità del prodotto solo con una fusione utilizzabile."""
+        if not fused_result.get("usable"):
+            return False
+
+        product_key = str(
+            fused_result.get("product_key") or ""
+        ).strip().lower()
+        brand = str(fused_result.get("brand") or "").strip()
+        model = str(fused_result.get("model") or "").strip()
+
+        if not product_key or product_key == "unidentified" or not brand or not model:
+            return False
+
+        placeholder = "%s" if self.backend == "postgresql" else "?"
+        now = utc_now_iso()
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE listings
+                SET category = CASE
+                        WHEN {placeholder} <> '' THEN {placeholder}
+                        ELSE category
+                    END,
+                    brand = {placeholder},
+                    model = {placeholder},
+                    variant = {placeholder},
+                    storage = {placeholder},
+                    product_key = {placeholder},
+                    recognition_confidence = {placeholder},
+                    updated_at = {placeholder}
+                WHERE id = {placeholder}
+                """,
+                (
+                    str(fused_result.get("category") or ""),
+                    str(fused_result.get("category") or ""),
+                    brand,
+                    model,
+                    str(fused_result.get("variant") or ""),
+                    str(fused_result.get("storage_or_size") or ""),
+                    product_key,
+                    int(fused_result.get("confidence") or 0),
+                    now,
+                    str(listing_id),
+                ),
+            )
+            return cursor.rowcount > 0
+
 
     def record_evaluation(self, listing_id: str, result: Dict[str, Any]) -> None:
         placeholder = "%s" if self.backend == "postgresql" else "?"
