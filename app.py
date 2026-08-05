@@ -22,6 +22,7 @@ from product_identifier import identify_product as catalog_identify_product
 from visual_analyzer import analyze_listing, fetch_listing_context
 from recognition_fusion import fuse_recognition, should_use_vision
 from vision_cache import VisionCache, build_vision_hash
+from catalog_builder import CatalogBuilder
 from knowledge_engine import build_knowledge_report
 
 
@@ -142,6 +143,7 @@ DB_FILE = DATA_DIR / "radar_affari.sqlite3"
 DATABASE_TARGET = os.getenv("DATABASE_URL", "").strip() or str(DB_FILE)
 DB = RadarDatabase(DATABASE_TARGET)
 VISION_CACHE = VisionCache(DB)
+CATALOG_BUILDER = CatalogBuilder(DB)
 DB.migrate_json_files(
     history_file=HISTORY_FILE,
     state_file=STATE_FILE,
@@ -1793,7 +1795,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
 
     await update.message.reply_text(
-        "✅ Radar Affari Decision Engine v4.0 Hybrid Vision Test attivato.\n\n"
+        "✅ Radar Affari Decision Engine v4.1 Hybrid Vision + Catalog Builder attivato.\n\n"
         f"• Margine minimo: {MIN_MARGIN_EURO:.0f} €\n"
         f"• ROI minimo: {MIN_ROI_PERCENT:.0f}%\n"
         f"• Confronti minimi: {MIN_COMPARABLES}\n"
@@ -1811,6 +1813,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/topcompra - migliori compra e tratta\n"
         "/visiontest URL - analisi foto di un annuncio\n"
         "/visionunknowns [1-20] - prova Vision sugli sconosciuti\n"
+        "/catalogstats - statistiche catalogo appreso\n"
+        "/catalogpending [1-20] - candidati da revisionare\n"
+        "/catalogapprove ID - approva candidato\n"
+        "/catalogreject ID motivo - rifiuta candidato\n"
         "/reset - azzera memoria annunci\n"
         "/stop - disattiva avvisi"
     )
@@ -1822,9 +1828,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     db_stats = DB.stats()
     vision_stats = VISION_CACHE.stats()
+    catalog_stats = CATALOG_BUILDER.stats()
     stats = load_json(STATS_FILE, {"scans": 0})
     await update.message.reply_text(
-        f"🧠 Versione: Decision Engine v4.0 Hybrid Vision Test\n"
+        f"🧠 Versione: Decision Engine v4.1 Hybrid Vision + Catalog Builder\n"
         f"📡 Fonti configurate: {len(SOURCE_URLS)}\n"
         f"🔎 Parole chiave: {len(KEYWORDS)}\n"
         f"⏱ Controllo ogni {CHECK_MINUTES} minuti\n"
@@ -1843,6 +1850,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🧮 Valutazioni salvate: {db_stats['evaluations']}\n"
         f"🔄 Scansioni registrate: {int(stats.get('scans', 0))}\n"
         f"👁 Vision cache: {vision_stats['success']} riuscite, {vision_stats['errors']} errori\n"
+        f"🧠 Catalogo appreso: {catalog_stats['learned_products']} prodotti, "
+        f"{catalog_stats['pending']} candidati in attesa\n"
         f"👥 Iscritti: {len(subscribers())}\n"
         f"💾 Database: {DB.location_label}"
     )
@@ -2321,6 +2330,7 @@ def _vision_unknown_result_message(
     *,
     cache_hit: bool,
     database_updated: bool,
+    catalog_proposal: Dict[str, Any],
 ) -> str:
     conflicts = fused.get("conflicts") or []
     conflict_text = (
@@ -2348,7 +2358,11 @@ def _vision_unknown_result_message(
         f"Stato: {fused.get('status')}\n"
         f"Conflitti: {conflict_text}\n"
         f"Cache: {'riutilizzata' if cache_hit else 'nuova analisi'}\n"
-        f"Database aggiornato: {'sì' if database_updated else 'no'}\n\n"
+        f"Database aggiornato: {'sì' if database_updated else 'no'}\n"
+        f"Candidato catalogo: "
+        f"{'creato' if catalog_proposal.get('accepted') else 'non creato'}\n"
+        f"Motivo catalogo: "
+        f"{catalog_proposal.get('reason') or 'in attesa di approvazione'}\n\n"
         f"Link: {item.get('url') or ''}"
     )
 
@@ -2436,6 +2450,13 @@ async def _visionunknowns_worker(
                 fused,
             )
 
+            catalog_proposal = CATALOG_BUILDER.propose(
+                listing_id=str(item["id"]),
+                fused_result=fused,
+                title=str(item.get("title") or ""),
+                source_hash=vision_hash,
+            )
+
             if fused.get("usable"):
                 recovered += 1
             if fused.get("precise"):
@@ -2450,6 +2471,7 @@ async def _visionunknowns_worker(
                 fused,
                 cache_hit=cache_hit,
                 database_updated=database_updated,
+                catalog_proposal=catalog_proposal,
             )
             await application.bot.send_message(
                 chat_id=chat_id,
@@ -2534,6 +2556,132 @@ async def visionunknowns(
     )
 
 
+
+def _catalog_candidate_message(row: Dict[str, Any], index: int) -> str:
+    aliases = row.get("aliases") or []
+    aliases_text = ", ".join(aliases[:8]) or "nessuno"
+    return (
+        f"#{index}\n"
+        f"ID: {row.get('id')}\n"
+        f"Prodotto: {row.get('product_key')}\n"
+        f"Marca: {row.get('brand')}\n"
+        f"Famiglia: {row.get('family')}\n"
+        f"Modello: {row.get('model')}\n"
+        f"Variante: {row.get('variant') or 'n/d'}\n"
+        f"Memoria/taglia: {row.get('storage_or_size') or 'n/d'}\n"
+        f"Confidence: {row.get('confidence', 0)}/100\n"
+        f"Alias: {aliases_text}"
+    )
+
+
+async def catalogstats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    stats = CATALOG_BUILDER.stats()
+    await update.message.reply_text(
+        "🧠 CATALOG BUILDER\n\n"
+        f"Candidati totali: {stats['candidates_total']}\n"
+        f"In attesa: {stats['pending']}\n"
+        f"Approvati: {stats['approved']}\n"
+        f"Rifiutati: {stats['rejected']}\n"
+        f"Prodotti appresi: {stats['learned_products']}\n"
+        f"Evidenze totali: {stats['total_evidence']}"
+    )
+
+
+async def catalogpending(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 20))
+        except ValueError:
+            await update.message.reply_text(
+                "Uso: /catalogpending oppure /catalogpending 10"
+            )
+            return
+
+    rows = CATALOG_BUILDER.pending(limit)
+    if not rows:
+        await update.message.reply_text(
+            "✅ Nessun candidato catalogo in attesa."
+        )
+        return
+
+    await update.message.reply_text(
+        f"🧠 CANDIDATI CATALOGO: {len(rows)}"
+    )
+    for index, row in enumerate(rows, start=1):
+        await update.message.reply_text(
+            _catalog_candidate_message(row, index)[:3900]
+        )
+
+
+async def catalogapprove(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n/catalogapprove ID_CANDIDATO"
+        )
+        return
+
+    candidate_id = context.args[0].strip()
+    try:
+        result = CATALOG_BUILDER.approve(candidate_id)
+    except KeyError:
+        await update.message.reply_text("❌ Candidato non trovato.")
+        return
+    except Exception as exc:
+        log.exception("Approvazione catalogo fallita")
+        await update.message.reply_text(
+            f"❌ Approvazione fallita:\n{str(exc)[:600]}"
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ CANDIDATO APPROVATO\n\n"
+        f"Prodotto: {result['product_key']}\n"
+        f"Evidenze: {result['evidence_count']}\n"
+        f"Alias totali: {len(result['aliases'])}"
+    )
+
+
+async def catalogreject(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if update.message is None:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n/catalogreject ID_CANDIDATO motivo"
+        )
+        return
+
+    candidate_id = context.args[0].strip()
+    reason = " ".join(context.args[1:]).strip() or "rifiutato manualmente"
+
+    if not CATALOG_BUILDER.reject(candidate_id, reason):
+        await update.message.reply_text("❌ Candidato non trovato.")
+        return
+
+    await update.message.reply_text("🗑 Candidato rifiutato.")
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -2601,11 +2749,15 @@ def main() -> None:
     application.add_handler(CommandHandler("topcompra", topcompra))
     application.add_handler(CommandHandler("visiontest", visiontest))
     application.add_handler(CommandHandler("visionunknowns", visionunknowns))
+    application.add_handler(CommandHandler("catalogstats", catalogstats))
+    application.add_handler(CommandHandler("catalogpending", catalogpending))
+    application.add_handler(CommandHandler("catalogapprove", catalogapprove))
+    application.add_handler(CommandHandler("catalogreject", catalogreject))
     application.add_handler(CommandHandler("reset", reset))
     application.add_handler(CommandHandler("stop", stop))
 
     log.info(
-        "Avvio Radar Affari Decision Engine v4.0 Hybrid Vision Test: %s fonti, %s parole chiave, dati=%s",
+        "Avvio Radar Affari Decision Engine v4.1 Hybrid Vision + Catalog Builder: %s fonti, %s parole chiave, dati=%s",
         len(SOURCE_URLS),
         len(KEYWORDS),
         DATA_DIR,
@@ -2616,4 +2768,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
