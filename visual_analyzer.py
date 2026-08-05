@@ -223,13 +223,17 @@ def _extract_output_text(payload: Dict[str, Any]) -> str:
     )
 
 
-async def analyze_listing(url: str) -> Dict[str, Any]:
+async def analyze_listing(
+    url: str,
+    *,
+    listing_context: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise RuntimeError(
             "OPENAI_API_KEY non configurata nelle variabili Railway."
         )
 
-    listing = await fetch_listing_context(url)
+    listing = listing_context or await fetch_listing_context(url)
     image_urls = listing["image_urls"]
 
     if not image_urls:
@@ -297,7 +301,10 @@ async def analyze_listing(url: str) -> Dict[str, Any]:
     result = json.loads(_extract_output_text(payload))
 
     result["listing_title"] = listing["title"]
+    result["listing_description"] = listing["description"]
     result["listing_url"] = listing["url"]
+    result["image_urls"] = list(image_urls)
     result["images_analyzed"] = len(image_urls)
+    result["vision_model"] = VISION_MODEL
 
     return result
